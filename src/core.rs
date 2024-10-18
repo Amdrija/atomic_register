@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 use anyhow::{Ok, Result};
+use log::info;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 pub type NodeId = u16;
@@ -21,7 +22,7 @@ pub struct VirtualNetwork<T> where T: Debug + Send + Sync +'static{
 const SEND_CHANNEL_BUFFER: usize = 100;
 
 impl<T> VirtualNetwork<T> where T: Debug + Send + Sync + 'static{
-    fn new(node: NodeId, nodes: Vec<NodeId>) -> (Self, HashMap<NodeId, Receiver<Packet<T>>>) {
+    pub fn new(node: NodeId, nodes: Vec<NodeId>) -> (Self, HashMap<NodeId, Receiver<Packet<T>>>) {
         let mut senders = HashMap::new();
         let mut recvers = HashMap::new();
         for node_id in nodes {
@@ -33,7 +34,7 @@ impl<T> VirtualNetwork<T> where T: Debug + Send + Sync + 'static{
         (VirtualNetwork { node, senders }, recvers)
     }
 
-    async fn send(&self, destination: NodeId, data: T) -> Result<()> {
+    pub async fn send(&self, destination: NodeId, data: T) -> Result<()> {
         let packet = Packet {
             from: self.node,
             to: destination,
@@ -45,9 +46,16 @@ impl<T> VirtualNetwork<T> where T: Debug + Send + Sync + 'static{
     }
 }
 
-mod test {
-    use tokio::join;
+impl<T> Drop for VirtualNetwork<T> where T: Debug + Send + Sync +'static {
+    fn drop(&mut self) {
+        for (node_id, channel) in self.senders.drain() {
+            info!("Closed Send part of channel for node {node_id}");
+            drop(channel);
+        }
+    }
+}
 
+mod test {
     use crate::core::{VirtualNetwork, NodeId};
 
     #[tokio::test]
