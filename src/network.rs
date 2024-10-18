@@ -1,31 +1,79 @@
+use crate::config::Config;
+use crate::core::{NodeId, Packet, VirtualNetwork};
 use anyhow::{Context, Result};
-use rkyv::rancor::{Error, Strategy};
-use rkyv::{Archive, Deserialize, Serialize};
-use std::future::Future;
-use std::time::Duration;
-use std::{collections::HashMap, net::SocketAddr};
-use std::fmt::Debug;
-use log::info;
+use log::{debug, info};
 use rkyv::api::high::{HighSerializer, HighValidator};
 use rkyv::bytecheck::CheckBytes;
 use rkyv::de::Pool;
+use rkyv::rancor::{Error, Strategy};
 use rkyv::ser::allocator::ArenaHandle;
 use rkyv::util::AlignedVec;
+use rkyv::{Archive, Deserialize, Serialize};
+use std::fmt::Debug;
+use std::future::Future;
+use std::time::Duration;
+use std::{collections::HashMap, net::SocketAddr};
+use tokio::sync::mpsc;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpSocket, TcpStream},
     sync::mpsc::{Receiver, Sender},
 };
 
-use crate::core::{NodeId, Packet};
+pub async fn initialize_connections<T>(
+    config: &Config,
+) -> Result<(
+    VirtualNetwork<T>,
+    Receiver<Packet<T>>,
+    Vec<impl Future<Output = Result<()>>>,
+    Vec<impl Future<Output = Result<()>>>,
+)>
+where
+    T: Debug
+        + Send
+        + Sync
+        + 'static
+        + Archive
+        + for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, Error>>,
+    T::Archived:
+        for<'a> CheckBytes<HighValidator<'a, Error>> + Deserialize<T, Strategy<Pool, Error>>,
+{
+    let (recv_send, recv_recv) = mpsc::channel::<Packet<T>>(20);
+    let receiver_handle = tokio::spawn(initialize_recv(
+        config.nodes[&config.my_node_id].destination,
+        recv_send,
+        config.my_node_id,
+        config.get_from_addresses(),
+    ));
+
+    let (virtual_network, receivers) =
+        VirtualNetwork::new(config.my_node_id, config.nodes.keys().cloned().collect());
+    let mut send_loop_tasks = Vec::new();
+    for (node_id, receiver) in receivers {
+        let sender = initialize_send(
+            config.nodes[&config.my_node_id].source,
+            config.nodes[&node_id].destination,
+            receiver,
+        )
+        .await;
+        send_loop_tasks.push(sender);
+    }
+
+    let receiver_tasks = receiver_handle.await??;
+    Ok((virtual_network, recv_recv, receiver_tasks, send_loop_tasks))
+}
 
 pub async fn initialize_send<T>(
     my_address: SocketAddr,
     destination_address: SocketAddr,
     recv: Receiver<Packet<T>>,
-) -> impl Future<Output=Result<()>>
+) -> impl Future<Output = Result<()>>
 where
-    T:  Debug + Send + Sync + 'static + for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, Error>>,
+    T: Debug
+        + Send
+        + Sync
+        + 'static
+        + for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, Error>>,
 {
     loop {
         let socket = TcpSocket::new_v4().unwrap();
@@ -40,18 +88,27 @@ where
     }
 }
 
-async fn send_loop<T>
-(
+async fn send_loop<T>(
     mut stream: TcpStream,
     mut recv: Receiver<Packet<T>>,
     destination_address: SocketAddr,
 ) -> Result<()>
 where
-    T:  Debug + Send + Sync + 'static + for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, Error>>,
+    T: Debug
+        + Send
+        + Sync
+        + 'static
+        + for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, Error>>,
 {
     while let Some(packet) = recv.recv().await {
         //TODO: Do we want to crash it, or print an error and continue?
-        let serialized = serialize(&packet.data).with_context(|| format!("Failed to serialize packet: {:#?}", packet))?;
+        let serialized = serialize(&packet.data)
+            .with_context(|| format!("Failed to serialize packet: {:#?}", packet))?;
+        debug!(
+            "Node {} sending data to {}",
+            stream.local_addr().unwrap(),
+            stream.peer_addr().unwrap()
+        );
         stream
             .write(&serialized)
             .await
@@ -64,7 +121,11 @@ where
 
 fn serialize<T>(payload: &T) -> Result<Vec<u8>>
 where
-    T:  Debug + Send + Sync + 'static + for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, Error>>,
+    T: Debug
+        + Send
+        + Sync
+        + 'static
+        + for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, Error>>,
 {
     let payload = rkyv::to_bytes::<Error>(payload)?;
     let len = payload.len();
@@ -76,25 +137,29 @@ where
 
 pub async fn initialize_recv<T>(
     receive_address: SocketAddr,
-    mut senders: HashMap<SocketAddr, Sender<Packet<T>>>,
+    sender: Sender<Packet<T>>,
     my_id: NodeId,
-    from_addresses: HashMap<SocketAddr, NodeId>,
-) -> Result<Vec<impl Future<Output=Result<()>>>>
+    mut from_addresses: HashMap<SocketAddr, NodeId>,
+) -> Result<Vec<impl Future<Output = Result<()>>>>
 where
     T: Debug + Send + Sync + 'static + Archive,
-    T::Archived: for<'a> CheckBytes<HighValidator<'a, Error>> + Deserialize<T, Strategy<Pool, Error>>,
+    T::Archived:
+        for<'a> CheckBytes<HighValidator<'a, Error>> + Deserialize<T, Strategy<Pool, Error>>,
 {
     let socket = TcpListener::bind(receive_address).await?;
     let mut futures = Vec::new();
-    while !senders.is_empty() {
+    while !from_addresses.is_empty() {
         let (stream, source_address) = socket.accept().await?;
 
         // Ignore unknown connections
-        if let Some(sender) = senders.remove(&source_address) {
-            futures.push(read(stream, from_addresses[&source_address], my_id, sender));
+        if let Some(from_address) = from_addresses.remove(&source_address) {
+            futures.push(read(stream, from_address, my_id, sender.clone()));
         }
     }
-    info!("Initialized connections from {receive_address} to nodes: {:#?}", from_addresses);
+    info!(
+        "Initialized connections from {receive_address} to nodes: {:#?}",
+        from_addresses
+    );
 
     Ok(futures)
 }
@@ -107,8 +172,14 @@ async fn read<T>(
 ) -> Result<()>
 where
     T: Debug + Send + Sync + 'static + Archive,
-    T::Archived: for<'a> CheckBytes<HighValidator<'a, Error>> + Deserialize<T, Strategy<Pool, Error>>,
+    T::Archived:
+        for<'a> CheckBytes<HighValidator<'a, Error>> + Deserialize<T, Strategy<Pool, Error>>,
 {
+    info!(
+        "Started reading from {} to {}",
+        stream.peer_addr().unwrap(),
+        stream.local_addr().unwrap()
+    );
     let mut len_left = 0u8;
     let mut payload = Vec::new();
     loop {
@@ -118,21 +189,38 @@ where
             info!("Node {to} closed stream from node {from}");
             break;
         }
-
-        let (packets, new_len_left) = read_packets_from_buffer(&buffer, n, len_left as usize, &mut payload)?;
+        debug!(
+            "node {} received data from {}",
+            stream.local_addr().unwrap(),
+            stream.peer_addr().unwrap()
+        );
+        let (packets, new_len_left) =
+            read_packets_from_buffer(&buffer, n, len_left as usize, &mut payload)?;
         len_left = new_len_left as u8;
         for packet in packets {
-            sender.send(Packet {from, to, data: packet}).await?;
+            sender
+                .send(Packet {
+                    from,
+                    to,
+                    data: packet,
+                })
+                .await?;
         }
     }
 
     Ok(())
 }
 
-fn read_packets_from_buffer<T>(buffer: &[u8], n: usize, mut len_left: usize, payload: &mut Vec<u8>) -> Result<(Vec<T>, usize)>
+fn read_packets_from_buffer<T>(
+    buffer: &[u8],
+    n: usize,
+    mut len_left: usize,
+    payload: &mut Vec<u8>,
+) -> Result<(Vec<T>, usize)>
 where
     T: Debug + Send + Sync + 'static + Archive,
-    T::Archived: for<'a> CheckBytes<HighValidator<'a, Error>> + Deserialize<T, Strategy<Pool, Error>>,
+    T::Archived:
+        for<'a> CheckBytes<HighValidator<'a, Error>> + Deserialize<T, Strategy<Pool, Error>>,
 {
     let mut packets = Vec::new();
     let mut i = 0;
@@ -158,7 +246,9 @@ where
     Ok((packets, len_left))
 }
 
+#[cfg(test)]
 mod test {
+    use crate::core::Packet;
     use crate::network::{initialize_recv, initialize_send, read_packets_from_buffer, serialize};
     use rkyv::rancor::Error;
     use rkyv::{Archive, Deserialize, Serialize};
@@ -170,7 +260,6 @@ mod test {
     use tokio::sync::mpsc::{Receiver, Sender};
     use tokio::sync::oneshot;
     use tokio::try_join;
-    use crate::core::Packet;
 
     #[derive(Archive, Deserialize, Serialize, Debug, PartialEq, Clone)]
     struct TestPayload {
@@ -198,9 +287,10 @@ mod test {
         let (start1_send, start1_recv) = oneshot::channel();
         let (start2_send, start2_recv) = oneshot::channel();
         let mut receivers = Vec::new();
-        for (receiver_address, payload, start) in
-            vec![(receiver1_address, payload1, start1_send), (receiver2_address, payload2, start2_send)]
-        {
+        for (receiver_address, payload, start) in vec![
+            (receiver1_address, payload1, start1_send),
+            (receiver2_address, payload2, start2_send),
+        ] {
             let handle = tokio::spawn(async move {
                 let listener = TcpListener::bind(receiver_address).await.unwrap();
                 start.send(1).unwrap();
@@ -208,10 +298,13 @@ mod test {
                 assert_eq!(address, sender_address);
 
                 let mut buffer = [0u8; 100];
-                let n = stream.read(&mut buffer).await.unwrap();
+                let _n = stream.read(&mut buffer).await.unwrap();
                 let len = buffer[0] as usize;
                 let data = Vec::from(&buffer[1..len + 1]);
-                assert_eq!(payload, rkyv::from_bytes::<TestPayload, Error>(&data).unwrap());
+                assert_eq!(
+                    payload,
+                    rkyv::from_bytes::<TestPayload, Error>(&data).unwrap()
+                );
             });
             receivers.push(handle);
         }
@@ -255,7 +348,7 @@ mod test {
     fn test_serialize() {
         let payload = TestPayload {
             id: 1,
-            str: String::from("Hello")
+            str: String::from("Hello"),
         };
 
         let bytes = serialize(&payload);
@@ -286,20 +379,26 @@ mod test {
         let payload2_clone = payload2.clone();
 
         let receiver_id = 0;
-        let (recv1_send, mut recv1_recv) : (Sender<Packet<TestPayload>>, Receiver<Packet<TestPayload>>) = tokio::sync::mpsc::channel(10);
-        let (recv2_send, mut recv2_recv):  (Sender<Packet<TestPayload>>, Receiver<Packet<TestPayload>>) = tokio::sync::mpsc::channel(10);
-        let mut senders = HashMap::new();
-        senders.insert(sender1_address.clone(), recv1_send);
-        senders.insert(sender2_address.clone(), recv2_send);
+        let (recv_send, mut recv_recv): (
+            Sender<Packet<TestPayload>>,
+            Receiver<Packet<TestPayload>>,
+        ) = tokio::sync::mpsc::channel(10);
 
         let mut from_addresses = HashMap::new();
         from_addresses.insert(sender1_address, 1);
         from_addresses.insert(sender2_address, 2);
 
-        let readers = tokio::spawn(initialize_recv(receiver_address, senders, receiver_id, from_addresses));
+        let readers = tokio::spawn(initialize_recv(
+            receiver_address,
+            recv_send,
+            receiver_id,
+            from_addresses,
+        ));
 
         let mut senders = Vec::new();
-        for (sender_address, payload) in vec![(sender1_address, payload1), (sender2_address, payload2)] {
+        for (sender_address, payload) in
+            vec![(sender1_address, payload1), (sender2_address, payload2)]
+        {
             let handle = tokio::spawn(async move {
                 loop {
                     let socket = TcpSocket::new_v4().unwrap();
@@ -328,27 +427,30 @@ mod test {
             assert!(try_join!(sender).is_ok());
         }
 
-        let packet1 = recv1_recv.recv().await;
+        let packet1 = recv_recv.recv().await;
         assert!(packet1.is_some());
         let packet1 = packet1.unwrap();
+        let packet2 = recv_recv.recv().await;
+        assert!(packet2.is_some());
+        let packet2 = packet2.unwrap();
+        let mut packets = vec![packet1, packet2];
+        packets.sort_by(|p1, p2| p1.data.id.cmp(&p2.data.id));
+
+        let packet1 = &packets[0];
         assert_eq!(packet1.from, 1);
         assert_eq!(packet1.to, receiver_id);
         assert_eq!(packet1.data, payload1_clone);
-        assert!(recv1_recv.recv().await.is_none());
 
-        let packet2 = recv2_recv.recv().await;
-        assert!(packet2.is_some());
-        let packet2 = packet2.unwrap();
+        let packet2 = &packets[1];
         assert_eq!(packet2.from, 2);
         assert_eq!(packet2.to, receiver_id);
         assert_eq!(packet2.data, payload2_clone);
-        assert!(recv1_recv.recv().await.is_none());
+        assert!(recv_recv.recv().await.is_none());
 
         for handle in reader_handles {
             assert!(try_join!(handle).is_ok());
         }
     }
-
 
     #[test]
     fn test_read_packets_from_buffer_multiple_packets_in_one_buffer() {
@@ -364,7 +466,7 @@ mod test {
         let mut payload = serialize(&payload1).unwrap();
         payload.append(&mut serialize(&payload2).unwrap());
 
-        let result = read_packets_from_buffer(&payload, payload.len(),0, &mut Vec::new());
+        let result = read_packets_from_buffer(&payload, payload.len(), 0, &mut Vec::new());
         assert!(result.is_ok());
 
         let (packets, len_left): (Vec<TestPayload>, usize) = result.unwrap();
@@ -379,7 +481,7 @@ mod test {
             str: String::from_utf8(vec![65; 150]).unwrap(),
         };
 
-        let mut buffer = serialize(&payload).unwrap();
+        let buffer = serialize(&payload).unwrap();
 
         let mut current_read = Vec::new();
         let result = read_packets_from_buffer(&buffer[..100], 100, 0, &mut current_read);
@@ -387,8 +489,12 @@ mod test {
         let (packets, len_left): (Vec<TestPayload>, usize) = result.unwrap();
         assert_eq!(packets.len(), 0);
 
-
-        let result = read_packets_from_buffer(&buffer[100..], buffer.len() - 100, len_left, &mut current_read);
+        let result = read_packets_from_buffer(
+            &buffer[100..],
+            buffer.len() - 100,
+            len_left,
+            &mut current_read,
+        );
         assert!(result.is_ok());
         let (packets, len_left): (Vec<TestPayload>, usize) = result.unwrap();
         assert_eq!(len_left, 0);
