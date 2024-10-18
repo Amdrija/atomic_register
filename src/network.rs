@@ -170,6 +170,7 @@ mod test {
     use tokio::sync::mpsc::{Receiver, Sender};
     use tokio::sync::oneshot;
     use tokio::try_join;
+    use crate::core::Packet;
 
     #[derive(Archive, Deserialize, Serialize, Debug, PartialEq, Clone)]
     struct TestPayload {

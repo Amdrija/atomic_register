@@ -1,23 +1,40 @@
+use std::env;
+use std::fs::File;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::Duration;
 use log::{error, info};
 use rkyv::{Archive, Deserialize, Serialize};
 use tokio::sync::mpsc;
-use crate::core::{Packet, VirtualNetwork};
+use crate::core::{NodeId, Packet, VirtualNetwork};
+use anyhow::{anyhow, Error, Result};
+use crate::config::Config;
 use crate::network::{initialize_recv, initialize_send};
 
 mod core;
 mod network;
+mod config;
 
 #[derive(Debug, Serialize, Deserialize, Archive)]
 struct Message {
     text: String
 }
 
+
+
 #[tokio::main]
 async fn main() {
     pretty_env_logger::init_timed();
+
+    let parse_result = Config::new();
+    if let Err(error) = parse_result {
+        error!("Error when parsing config: {error}");
+        return;
+    }
+    let config = parse_result.unwrap();
+    info!("Finished parsing config: {:#?}", config);
+
 
     let receiver_address = SocketAddr::from_str("127.0.0.1:56551").unwrap();
     let sender_address = SocketAddr::from_str("127.0.0.1:46441").unwrap();
@@ -59,7 +76,7 @@ async fn main() {
 
     let print_handle = tokio::spawn(async move {
         while let Some(message) = recv_recv.recv().await {
-            info!("Received message: {:#?}", message);
+            info!("Received message: {}", message.data.text);
         }
     });
 
