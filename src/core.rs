@@ -15,9 +15,9 @@ pub struct Packet<T: Debug> {
 
 pub struct VirtualNetwork<T>
 where
-    T: Debug + Send + Sync + 'static,
+    T: Clone + Debug + Send + Sync + 'static,
 {
-    node: NodeId,
+    pub node: NodeId,
     senders: HashMap<NodeId, Sender<Packet<T>>>,
 }
 
@@ -25,7 +25,7 @@ const SEND_CHANNEL_BUFFER: usize = 100;
 
 impl<T> VirtualNetwork<T>
 where
-    T: Debug + Send + Sync + 'static,
+    T: Clone + Debug + Send + Sync + 'static,
 {
     pub fn new(node: NodeId, nodes: Vec<NodeId>) -> (Self, HashMap<NodeId, Receiver<Packet<T>>>) {
         let mut senders = HashMap::new();
@@ -49,11 +49,23 @@ where
 
         Ok(())
     }
+
+    pub async fn broadcast(&self, data: T) -> Result<()> {
+        for node_id in self.senders.keys() {
+            self.send(*node_id, data.clone()).await?;
+        }
+
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.senders.len()
+    }
 }
 
 impl<T> Drop for VirtualNetwork<T>
 where
-    T: Debug + Send + Sync + 'static,
+    T: Clone + Debug + Send + Sync + 'static,
 {
     fn drop(&mut self) {
         for (node_id, channel) in self.senders.drain() {
@@ -63,9 +75,50 @@ where
     }
 }
 
+pub fn create_channel_network<T>(
+    nodes: Vec<NodeId>,
+) -> (
+    HashMap<NodeId, VirtualNetwork<T>>,
+    HashMap<NodeId, Receiver<Packet<T>>>,
+)
+where
+    T: Clone + Debug + Send + Sync + 'static,
+{
+    let mut send_channels = HashMap::new();
+    let mut recv_channels = HashMap::new();
+    let mut virtual_networks = HashMap::new();
+    let mut network_recvs = HashMap::new();
+    for node in nodes.clone() {
+        let (node_send, node_recv) = mpsc::channel(20);
+        send_channels.insert(node, node_send);
+        recv_channels.insert(node, node_recv);
+
+        let (vn, node_network_recvs) = VirtualNetwork::new(node, nodes.clone());
+        virtual_networks.insert(node, vn);
+        network_recvs.insert(node, node_network_recvs);
+    }
+
+    for node in nodes.clone() {
+        let mut node_network_recvs = network_recvs.remove(&node).unwrap();
+        for (to, mut network_recv) in node_network_recvs.drain() {
+            let send = send_channels[&to].clone();
+            tokio::spawn(async move {
+                while let Some(packet) = network_recv.recv().await {
+                    send.send(packet).await.unwrap()
+                }
+            });
+        }
+    }
+
+    (virtual_networks, recv_channels)
+}
+
 #[cfg(test)]
 mod test {
-    use crate::core::{NodeId, VirtualNetwork};
+    use crate::core::{create_channel_network, NodeId, VirtualNetwork};
+    use futures::future::JoinAll;
+    use std::collections::HashSet;
+    use std::vec;
 
     #[tokio::test]
     async fn test_network() {
@@ -104,5 +157,40 @@ mod test {
 
             assert_eq!(packet_count, 1);
         }
+    }
+
+    #[tokio::test]
+    async fn test_channel_network() {
+        let nodes = vec![0, 1, 2, 3, 4, 5];
+        let (virtual_networks, node_recvs) = create_channel_network(nodes.clone());
+
+        let mut send_handles = Vec::new();
+        for (node, virtual_network) in virtual_networks {
+            let send_handle = tokio::spawn(async move {
+                virtual_network.broadcast(node).await.unwrap();
+            });
+
+            send_handles.push(send_handle);
+        }
+
+        let mut receive_handles = Vec::new();
+        for (node, mut node_recv) in node_recvs {
+            let mut nodes = nodes.iter().cloned().collect::<HashSet<_>>();
+            let receive_handle = tokio::spawn(async move {
+                while let Some(from_node) = node_recv.recv().await {
+                    assert!(nodes.contains(&from_node.data));
+                    assert!(nodes.contains(&from_node.from));
+                    assert_eq!(from_node.to, node);
+                    nodes.remove(&from_node.data);
+                }
+
+                assert!(nodes.is_empty());
+            });
+
+            receive_handles.push(receive_handle);
+        }
+
+        send_handles.into_iter().collect::<JoinAll<_>>().await;
+        receive_handles.into_iter().collect::<JoinAll<_>>().await;
     }
 }

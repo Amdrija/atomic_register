@@ -1,16 +1,17 @@
 use crate::config::Config;
 use crate::network::initialize_connections;
-use futures::future::{TryJoinAll};
+use futures::future::TryJoinAll;
 use log::{error, info};
 use rkyv::{Archive, Deserialize, Serialize};
 use std::fmt::Debug;
 use std::time::Duration;
 
+mod abd;
 mod config;
 mod core;
 mod network;
 
-#[derive(Debug, Serialize, Deserialize, Archive)]
+#[derive(Clone, Debug, Serialize, Deserialize, Archive)]
 struct Message {
     text: String,
 }

@@ -30,6 +30,7 @@ pub async fn initialize_connections<T>(
 )>
 where
     T: Debug
+        + Clone
         + Send
         + Sync
         + 'static
@@ -101,7 +102,6 @@ where
         + for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, Error>>,
 {
     while let Some(packet) = recv.recv().await {
-        //TODO: Do we want to crash it, or print an error and continue?
         let serialized = serialize(&packet.data)
             .with_context(|| format!("Failed to serialize packet: {:#?}", packet))?;
         debug!(
