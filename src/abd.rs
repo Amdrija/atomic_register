@@ -64,7 +64,7 @@ pub struct ABD {
     acks: Arc<Mutex<HashMap<u64, u16>>>,
     operations: Arc<Mutex<HashMap<u64, Operation>>>,
     operation_end: Arc<Mutex<HashMap<u64, Sender<()>>>>,
-    read_val: Arc<Mutex<HashMap<u64, u32>>>,
+    values_to_write: Arc<Mutex<HashMap<u64, u32>>>,
 }
 
 impl ABD {
@@ -85,7 +85,7 @@ impl ABD {
             acks: Arc::new(Mutex::new(HashMap::new())),
             operations: Arc::new(Mutex::new(HashMap::new())),
             operation_end: Arc::new(Mutex::new(HashMap::new())),
-            read_val: Arc::new(Mutex::new(HashMap::new())),
+            values_to_write: Arc::new(Mutex::new(HashMap::new())),
         };
 
         abd
@@ -110,41 +110,24 @@ impl ABD {
     }
 
     async fn process_value_message(&self, message: ValueMessage) {
-        let quorum_value = {
-            let mut read_list_guard = self.read_lists.lock().await;
-            let read_list = read_list_guard.get_mut(&message.operation_id);
-            if let None = read_list {
-                //Safely ignore because we have remove the read_list beforehand
-                return;
-            }
-            let read_list = read_list.unwrap();
-            read_list.push((message.timestamp, message.value));
-
-            if read_list.len() > self.network.len() / 2 {
-                let max_ts_value = read_list
-                    .iter()
-                    .max_by(|(ts1, _), (ts2, _)| ts1.cmp(ts2))
-                    .unwrap()
-                    .clone();
-                read_list_guard.remove(&message.operation_id);
-                Some(max_ts_value)
-            } else {
-                None
-            }
-        };
+        let operation_id = message.operation_id;
+        let quorum_value = self.get_quorum_value(message).await;
 
         if let Some((max_ts, mut value)) = quorum_value {
-            let operation = self.operations.lock().await;
-            let timestamp = match operation[&message.operation_id] {
+            let operations_guard = self.operations.lock().await;
+            let timestamp = match operations_guard[&operation_id] {
                 Operation::Read => {
-                    let mut read_val = self.read_val.lock().await;
-                    *read_val.get_mut(&message.operation_id).unwrap() = value;
+                    // When reading, we want to remember the value biggest value we
+                    // have read so far and write it to a majority
+                    let mut values_to_write = self.values_to_write.lock().await;
+                    *values_to_write.get_mut(&operation_id).unwrap() = value;
 
                     max_ts
                 }
                 Operation::Write => {
-                    let mut read_val = self.read_val.lock().await;
-                    value = read_val.remove(&message.operation_id).unwrap();
+                    // When writing, we have to write the value to the majority
+                    let mut value_to_write = self.values_to_write.lock().await;
+                    value = value_to_write.remove(&operation_id).unwrap();
 
                     Timestamp {
                         timestamp: max_ts.timestamp + 1,
@@ -155,15 +138,38 @@ impl ABD {
             };
 
             let write_message = WriteMessage {
-                operation_id: message.operation_id,
+                operation_id,
                 timestamp,
-                value, // TODO: Here needed to send write_value
+                value,
             };
 
             self.network
                 .broadcast(Message::WriteMessage(write_message))
                 .await
                 .unwrap();
+        }
+    }
+
+    async fn get_quorum_value(&self, message: ValueMessage) -> Option<(Timestamp, u32)> {
+        let mut read_list_guard = self.read_lists.lock().await;
+        let read_list = read_list_guard.get_mut(&message.operation_id);
+        if let None = read_list {
+            //Safely ignore because we have removed the read_list beforehand
+            return None;
+        }
+        let read_list = read_list.unwrap();
+        read_list.push((message.timestamp, message.value));
+
+        if read_list.len() == self.network.len() / 2 + 1 {
+            let max_ts_value = read_list
+                .iter()
+                .max_by(|(ts1, _), (ts2, _)| ts1.cmp(ts2))
+                .unwrap()
+                .clone();
+            read_list_guard.remove(&message.operation_id);
+            Some(max_ts_value)
+        } else {
+            None
         }
     }
 
@@ -189,6 +195,7 @@ impl ABD {
         let mut ack_guard = self.acks.lock().await;
         let acks = ack_guard.get_mut(&message.operation_id);
         if let None = acks {
+            // Safely ignore because the majority was already reached
             return;
         }
         let acks = acks.unwrap();
@@ -232,47 +239,35 @@ impl ABD {
     }
 
     pub async fn read(&self) -> Result<u32> {
-        let message = ReadMessage {
-            operation_id: self.next_operation_id.fetch_add(1, Ordering::SeqCst),
-        };
-
-        {
-            let mut read_lists = self.read_lists.lock().await;
-            read_lists.insert(message.operation_id, Vec::new());
-        }
-
-        {
-            let mut operation = self.operations.lock().await;
-            operation.insert(message.operation_id, Operation::Read);
-        }
-
-        {
-            let mut acks = self.acks.lock().await;
-            acks.insert(message.operation_id, 0);
-        }
-
-        {
-            let mut readval = self.read_val.lock().await;
-            readval.insert(message.operation_id, 0);
-        }
-
-        let (send, recv) = oneshot::channel();
-        {
-            let mut operation_end = self.operation_end.lock().await;
-            operation_end.insert(message.operation_id, send);
-        }
+        let (message, terminate) = self.initialize_operation(Operation::Read, 0).await;
 
         let operation_id = message.operation_id;
         self.network
             .broadcast(Message::ReadMessage(message))
             .await?;
-        recv.await?;
-        let readval = self.read_val.lock().await;
+        terminate.await?;
+        let mut values_to_write = self.values_to_write.lock().await;
+        let value = values_to_write.remove(&operation_id).unwrap();
 
-        Ok(readval[&operation_id])
+        Ok(value)
     }
 
     pub async fn write(&self, value: u32) -> Result<()> {
+        let (message, terminate) = self.initialize_operation(Operation::Write, value).await;
+
+        self.network
+            .broadcast(Message::ReadMessage(message))
+            .await?;
+        terminate.await?;
+
+        Ok(())
+    }
+
+    async fn initialize_operation(
+        &self,
+        operation: Operation,
+        value: u32,
+    ) -> (ReadMessage, oneshot::Receiver<()>) {
         let message = ReadMessage {
             operation_id: self.next_operation_id.fetch_add(1, Ordering::SeqCst),
         };
@@ -283,8 +278,8 @@ impl ABD {
         }
 
         {
-            let mut operation = self.operations.lock().await;
-            operation.insert(message.operation_id, Operation::Write);
+            let mut operation_guard = self.operations.lock().await;
+            operation_guard.insert(message.operation_id, operation);
         }
 
         {
@@ -293,8 +288,8 @@ impl ABD {
         }
 
         {
-            let mut readval = self.read_val.lock().await;
-            readval.insert(message.operation_id, value);
+            let mut values_to_write = self.values_to_write.lock().await;
+            values_to_write.insert(message.operation_id, value);
         }
 
         let (send, recv) = oneshot::channel();
@@ -303,11 +298,7 @@ impl ABD {
             operation_end.insert(message.operation_id, send);
         }
 
-        self.network
-            .broadcast(Message::ReadMessage(message))
-            .await?;
-        recv.await?;
-        Ok(())
+        (message, recv)
     }
 }
 
