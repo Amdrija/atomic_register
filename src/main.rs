@@ -4,7 +4,10 @@ use futures::future::TryJoinAll;
 use log::{error, info};
 use rkyv::{Archive, Deserialize, Serialize};
 use std::fmt::Debug;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
+use crate::abd::ABD;
 
 mod abd;
 mod config;
@@ -34,7 +37,7 @@ async fn main() {
         return;
     }
     info!("Initialized connections to all nodes");
-    let (virtual_network, mut receiver_channel, read_tasks, send_loop_tasks) = result.unwrap();
+    let (virtual_network, receiver_channel, read_tasks, send_loop_tasks) = result.unwrap();
 
     let reader_handles = read_tasks
         .into_iter()
@@ -45,32 +48,28 @@ async fn main() {
         .map(|send_task| tokio::spawn(send_task))
         .collect::<Vec<_>>();
 
-    for i in 0..5 {
-        virtual_network
-            .send(
-                1,
-                Message {
-                    text: String::from(format!("Hello {} from {}", i, config.my_node_id)),
-                },
-            )
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    let abd = Arc::new(ABD::new(virtual_network));
+    let (quit, quit_signal) = mpsc::channel(1);
+    let abd_clone = abd.clone();
+    let receive_loop_handle = tokio::spawn(async move {
+        abd_clone.receive_loop(receiver_channel, quit_signal).await;
+    });
+
+    tokio::time::sleep(Duration::from_secs(3 - config.my_node_id as u64)).await;
+    abd.write(1, 10 + config.my_node_id as u32).await.unwrap();
+
+    for node in config.nodes.keys() {
+        info!("Node {} read key {}: {}", config.my_node_id, node, abd.read(*node as u64).await.unwrap());
     }
 
-    let print_handle = tokio::spawn(async move {
-        while let Some(message) = receiver_channel.recv().await {
-            info!(
-                "Node {} received message: {} from {}",
-                message.to, message.data.text, message.from
-            );
-        }
-    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    info!("Initiated exit");
+    quit.send(()).await.unwrap();
 
     //Cleanup
     info!("Cleaning up and exiting");
-    drop(virtual_network);
-    print_handle.await.unwrap();
+    receive_loop_handle.await.unwrap();
+    drop(abd);
 
     let read_result = reader_handles.into_iter().collect::<TryJoinAll<_>>().await;
     if let Err(error) = read_result {
