@@ -4,7 +4,6 @@ use log::info;
 use rkyv::{Archive, Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::select;
@@ -22,18 +21,21 @@ struct Timestamp {
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct ReadMessage {
     operation_id: u64,
+    key: u64,
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct ValueMessage {
     operation_id: u64,
+    key: u64,
     timestamp: Timestamp,
-    value: u32,
+    value: u32
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct WriteMessage {
     operation_id: u64,
+    key: u64,
     timestamp: Timestamp,
     value: u32,
 }
@@ -59,7 +61,7 @@ enum Operation {
 pub struct ABD {
     next_operation_id: AtomicU64,
     network: VirtualNetwork<Message>,
-    current_value: Arc<Mutex<(Timestamp, u32)>>,
+    kv_store: Arc<Mutex<HashMap<u64, (Timestamp, u32)>>>,
     read_lists: Arc<Mutex<HashMap<u64, Vec<(Timestamp, u32)>>>>,
     acks: Arc<Mutex<HashMap<u64, u16>>>,
     operations: Arc<Mutex<HashMap<u64, Operation>>>,
@@ -69,18 +71,10 @@ pub struct ABD {
 
 impl ABD {
     pub fn new(network: VirtualNetwork<Message>) -> Self {
-        let my_node_id = network.node;
         let abd = ABD {
             next_operation_id: AtomicU64::new(0),
             network,
-            current_value: Arc::new(Mutex::new((
-                Timestamp {
-                    timestamp: 0,
-                    writer_id: my_node_id,
-                    thread_id: thread_id::get(),
-                },
-                0,
-            ))),
+            kv_store: Arc::new(Mutex::new(HashMap::new())),
             read_lists: Arc::new(Mutex::new(HashMap::new())),
             acks: Arc::new(Mutex::new(HashMap::new())),
             operations: Arc::new(Mutex::new(HashMap::new())),
@@ -93,14 +87,23 @@ impl ABD {
 
     async fn process_read_message(&self, message: ReadMessage, from: NodeId) {
         let (timestamp, value) = {
-            let current_value = self.current_value.lock().await;
-            current_value.clone()
+            let kv_guard = self.kv_store.lock().await;
+            let ts_value = kv_guard.get(&message.key);
+            match ts_value {
+                None => (Timestamp {
+                    timestamp: 0,
+                    writer_id: self.network.node,
+                    thread_id: thread_id::get()
+                }, 0),
+                Some(ts_value) => ts_value.clone()
+            }
         };
 
         let value_message = ValueMessage {
             operation_id: message.operation_id,
+            key: message.key,
             timestamp,
-            value,
+            value
         };
 
         self.network
@@ -111,6 +114,7 @@ impl ABD {
 
     async fn process_value_message(&self, message: ValueMessage) {
         let operation_id = message.operation_id;
+        let key = message.key;
         let quorum_value = self.get_quorum_value(message).await;
 
         if let Some((max_ts, mut value)) = quorum_value {
@@ -139,6 +143,7 @@ impl ABD {
 
             let write_message = WriteMessage {
                 operation_id,
+                key,
                 timestamp,
                 value,
             };
@@ -174,10 +179,17 @@ impl ABD {
     }
 
     async fn process_write_message(&self, message: WriteMessage, from: NodeId) {
-        let mut current_val = self.current_value.lock().await;
-        let (ts, _) = current_val.deref();
-        if message.timestamp > *ts {
-            *current_val = (message.timestamp, message.value);
+        let mut kv_store_guard = self.kv_store.lock().await;
+        let current_value = kv_store_guard.get_mut(&message.key);
+        match current_value {
+            None => {
+                kv_store_guard.insert(message.key, (message.timestamp, message.value));
+            }
+            Some(current_value) => {
+                if message.timestamp > current_value.0 {
+                    *current_value = (message.timestamp, message.value);
+                }
+            }
         }
 
         self.network
@@ -238,8 +250,8 @@ impl ABD {
         }
     }
 
-    pub async fn read(&self) -> Result<u32> {
-        let (message, terminate) = self.initialize_operation(Operation::Read, 0).await;
+    pub async fn read(&self, key: u64) -> Result<u32> {
+        let (message, terminate) = self.initialize_operation(Operation::Read, key, 0).await;
 
         let operation_id = message.operation_id;
         self.network
@@ -252,8 +264,8 @@ impl ABD {
         Ok(value)
     }
 
-    pub async fn write(&self, value: u32) -> Result<()> {
-        let (message, terminate) = self.initialize_operation(Operation::Write, value).await;
+    pub async fn write(&self, key: u64, value: u32) -> Result<()> {
+        let (message, terminate) = self.initialize_operation(Operation::Write, key, value).await;
 
         self.network
             .broadcast(Message::ReadMessage(message))
@@ -266,10 +278,12 @@ impl ABD {
     async fn initialize_operation(
         &self,
         operation: Operation,
+        key: u64,
         value: u32,
     ) -> (ReadMessage, oneshot::Receiver<()>) {
         let message = ReadMessage {
             operation_id: self.next_operation_id.fetch_add(1, Ordering::SeqCst),
+            key
         };
 
         {
@@ -343,7 +357,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_abd_synchronous() {
+    async fn test_abd_sequential() {
         let nodes = vec![0, 1, 2, 3, 4];
         let (virtual_networks, recv_channels) = create_channel_network(nodes.clone());
 
@@ -352,9 +366,9 @@ mod tests {
 
         for node in &nodes {
             let write_value = (node * 10) as u32;
-            abds[node].write(write_value).await.unwrap();
+            abds[node].write(12, write_value).await.unwrap();
             for node in &nodes {
-                let read = abds[node].read().await.unwrap();
+                let read = abds[node].read(12).await.unwrap();
                 println!("Node {node} reads {read}");
                 assert_eq!(read, write_value);
             }
@@ -381,8 +395,8 @@ mod tests {
             let node = *node;
             let write_handle = tokio::spawn(async move {
                 let write_value = (node * 10) as u32;
-                abd.write(write_value).await.unwrap();
-                let read = abd.read().await.unwrap();
+                abd.write(14, write_value).await.unwrap();
+                let read = abd.read(node as u64).await.unwrap();
                 println!("Node {node} reads {read}");
             });
             write_handles.push(write_handle);
@@ -392,12 +406,38 @@ mod tests {
 
         let mut read_values = HashSet::new();
         for node in &nodes {
-            let read = abds[node].read().await.unwrap();
+            let read = abds[node].read(14).await.unwrap();
             println!("Node {node} reads {read}");
             read_values.insert(read);
         }
 
         assert_eq!(read_values.len(), 1);
+
+        for quit_signal in quit_signals {
+            quit_signal.send(()).await.unwrap();
+        }
+        drop(abds);
+        receive_handles.into_iter().collect::<JoinAll<_>>().await;
+    }
+
+    #[tokio::test]
+    async fn test_abd_sequential_different_keys() {
+        let nodes = vec![0, 1, 2, 3, 4];
+        let (virtual_networks, recv_channels) = create_channel_network(nodes.clone());
+
+        let (abds, receive_handles, quit_signals) =
+            initialize_abds(nodes.clone(), virtual_networks, recv_channels);
+
+        for node in &nodes {
+            let key = *node as u64;
+            let write_value = (node * 10) as u32;
+            abds[node].write(key, write_value).await.unwrap();
+            for node in &nodes {
+                let read = abds[node].read(key).await.unwrap();
+                println!("Node {node} reads {read}");
+                assert_eq!(read, write_value);
+            }
+        }
 
         for quit_signal in quit_signals {
             quit_signal.send(()).await.unwrap();
