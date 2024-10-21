@@ -1,3 +1,4 @@
+use crate::abd::ABD;
 use crate::config::Config;
 use crate::network::initialize_connections;
 use futures::future::TryJoinAll;
@@ -5,9 +6,8 @@ use log::{error, info};
 use rkyv::{Archive, Deserialize, Serialize};
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
-use crate::abd::ABD;
 
 mod abd;
 mod config;
@@ -22,7 +22,7 @@ struct Message {
 #[tokio::main]
 async fn main() {
     pretty_env_logger::init_timed();
-
+    info!("Started");
     let parse_result = Config::new();
     if let Err(error) = parse_result {
         error!("Error when parsing config: {error}");
@@ -56,13 +56,35 @@ async fn main() {
     });
 
     tokio::time::sleep(Duration::from_secs(3 - config.my_node_id as u64)).await;
-    abd.write(1, 10 + config.my_node_id as u32).await.unwrap();
-
-    for node in config.nodes.keys() {
-        info!("Node {} read key {}: {}", config.my_node_id, node, abd.read(*node as u64).await.unwrap());
+    if config.my_node_id == 1 {
+        let before_write = SystemTime::now();
+        abd.write(1, 10 + config.my_node_id as u32).await.unwrap();
+        let after_write = SystemTime::now();
+        info!(
+            "Node {} wrote key {}: {} time: {}ms",
+            config.my_node_id,
+            1,
+            10 + config.my_node_id as u32,
+            after_write
+                .duration_since(before_write)
+                .unwrap()
+                .as_millis()
+        );
+    } else {
+        // tokio::time::sleep(Duration::from_secs(2)).await;
+        // let before_read = SystemTime::now();
+        // let read = abd.read(1).await.unwrap();
+        // let after_read = SystemTime::now();
+        // info!(
+        //     "Node {} read key {}: {} time: {}ms",
+        //     config.my_node_id,
+        //     1,
+        //     read,
+        //     after_read.duration_since(before_read).unwrap().as_millis()
+        // );
     }
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
     info!("Initiated exit");
     quit.send(()).await.unwrap();
 

@@ -29,7 +29,7 @@ pub struct ValueMessage {
     operation_id: u64,
     key: u64,
     timestamp: Timestamp,
-    value: u32
+    value: u32,
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
@@ -90,12 +90,15 @@ impl ABD {
             let kv_guard = self.kv_store.lock().await;
             let ts_value = kv_guard.get(&message.key);
             match ts_value {
-                None => (Timestamp {
-                    timestamp: 0,
-                    writer_id: self.network.node,
-                    thread_id: thread_id::get()
-                }, 0),
-                Some(ts_value) => ts_value.clone()
+                None => (
+                    Timestamp {
+                        timestamp: 0,
+                        writer_id: self.network.node,
+                        thread_id: thread_id::get(),
+                    },
+                    0,
+                ),
+                Some(ts_value) => ts_value.clone(),
             }
         };
 
@@ -103,7 +106,7 @@ impl ABD {
             operation_id: message.operation_id,
             key: message.key,
             timestamp,
-            value
+            value,
         };
 
         self.network
@@ -265,7 +268,9 @@ impl ABD {
     }
 
     pub async fn write(&self, key: u64, value: u32) -> Result<()> {
-        let (message, terminate) = self.initialize_operation(Operation::Write, key, value).await;
+        let (message, terminate) = self
+            .initialize_operation(Operation::Write, key, value)
+            .await;
 
         self.network
             .broadcast(Message::ReadMessage(message))
@@ -283,7 +288,7 @@ impl ABD {
     ) -> (ReadMessage, oneshot::Receiver<()>) {
         let message = ReadMessage {
             operation_id: self.next_operation_id.fetch_add(1, Ordering::SeqCst),
-            key
+            key,
         };
 
         {
