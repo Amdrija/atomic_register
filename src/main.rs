@@ -55,33 +55,31 @@ async fn main() {
         abd_clone.receive_loop(receiver_channel, quit_signal).await;
     });
 
-    tokio::time::sleep(Duration::from_secs(3 - config.my_node_id as u64)).await;
-    if config.my_node_id == 1 {
-        let before_write = SystemTime::now();
-        abd.write(1, 10 + config.my_node_id as u32).await.unwrap();
-        let after_write = SystemTime::now();
+    let before_write = SystemTime::now();
+    abd.write(1, 10 + config.my_node_id as u32).await.unwrap();
+    let after_write = SystemTime::now();
+    info!(
+        "Node {} wrote key {}: {} time: {}ms",
+        config.my_node_id,
+        1,
+        10 + config.my_node_id as u32,
+        after_write
+            .duration_since(before_write)
+            .unwrap()
+            .as_millis()
+    );
+
+    for (node, _) in config.nodes {
+        let before_read = SystemTime::now();
+        let read = abd.read(node as u64).await.unwrap();
+        let after_read = SystemTime::now();
         info!(
-            "Node {} wrote key {}: {} time: {}ms",
+            "Node {} read key {}: {} time: {}ms",
             config.my_node_id,
-            1,
-            10 + config.my_node_id as u32,
-            after_write
-                .duration_since(before_write)
-                .unwrap()
-                .as_millis()
+            node,
+            read,
+            after_read.duration_since(before_read).unwrap().as_millis()
         );
-    } else {
-        // tokio::time::sleep(Duration::from_secs(2)).await;
-        // let before_read = SystemTime::now();
-        // let read = abd.read(1).await.unwrap();
-        // let after_read = SystemTime::now();
-        // info!(
-        //     "Node {} read key {}: {} time: {}ms",
-        //     config.my_node_id,
-        //     1,
-        //     read,
-        //     after_read.duration_since(before_read).unwrap().as_millis()
-        // );
     }
 
     tokio::time::sleep(Duration::from_secs(5)).await;

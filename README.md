@@ -55,21 +55,7 @@ To reset the rules:
 
 ### Network Problems
 
-Currently, when running with 2 nodes, there's a problem with the algorithm taking 4RTs to complete.
-This occurs because node is using the same connection for sending and receiving packets to itself.
-
-The TCP Flow Graphs captured from Wireshark revealed this:
-
-![4 Round Trips for sending to itself](network_tcp_flow_node1_node1.jpeg)
-
-As you can see from the previous graph, it takes 700ms to perform the operation for itself. 
-Compared to the same operation performed while communicating with a different node:
-
-![2 Round Trips for sending to another node](network_tcp_flow_node1_node2.jpeg)
-
-To confirm this theory, I ran the same algorithm with 3 nodes and it took only 2RTs.
-
-Fixes:
-
-1. Don't have any delay on the same interface (but doesn't fix the underlying issue)
-2. Don't go through network when sending packets to yourself.
+In times of concurrent operations, the algorithm is taking 4RTs to complete.
+This occurs because the Nagel's algorithm was enabled. 
+Because the packets are very small, Nagel's algorithm would wait until ACK arrives before sending the next messagee.
+As a result, if 2 nodes start an operation around the same time

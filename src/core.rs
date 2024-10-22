@@ -75,6 +75,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub fn create_channel_network<T>(
     nodes: Vec<NodeId>,
 ) -> (

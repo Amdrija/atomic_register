@@ -101,6 +101,7 @@ where
         + 'static
         + for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, Error>>,
 {
+    stream.set_nodelay(true)?;
     while let Some(packet) = recv.recv().await {
         let serialized = serialize(&packet.data)
             .with_context(|| format!("Failed to serialize packet: {:#?}", packet))?;
