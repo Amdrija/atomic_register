@@ -19,11 +19,11 @@ Unlike most commercial key-value stores, an important distinction of this projec
 
 The idea is very simple, abstract away the network layer (in this case TCP) completely behind channels. The algorithms will just take receive channels to receive messages and a "virtual" network of channels to send messages to appropriate nodes. This way, I can quickly implement different algorithms and test them on exactly the same network code. Another benefit of this is that the algorithms become easily testable, as now I can just emulate the network through the channels.
 
-![Software Architecture](software_architecture.png)
+![Software Architecture](assets/software_architecture.png)
 
 The network is fully symmetric with each node connected to other nodes with 2 half-duplex TCP connections. Basically, each node has a port used to receive the messages and a port from which it sends messages. This is because it is not possible to bind 2 TCP sockets to the same port at the same time (so either a node can receive messages on the port, or connect to another node from a port). As a result, it is a lot more complex to build such a system using full-duplex connections, as the network isn't symmetrical, but some nodes must listen and some must connect. Consequently, there has to be some kind of ordering for initialization, which further complicates code.
 
-![Network Architecture](network_ports.png)
+![Network Architecture](assets/network_ports.png)
 
 ## How to start the program
 
