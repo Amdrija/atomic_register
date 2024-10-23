@@ -8,6 +8,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
+use anyhow::Result;
 
 mod abd;
 mod config;
@@ -20,13 +21,13 @@ struct Message {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     pretty_env_logger::init_timed();
     info!("Started");
     let parse_result = Config::new();
     if let Err(error) = parse_result {
         error!("Error when parsing config: {error}");
-        return;
+        return Err(error);
     }
     let config = parse_result.unwrap();
     info!("Finished parsing config: {:#?}", config);
@@ -34,7 +35,7 @@ async fn main() {
     let result = initialize_connections(&config).await;
     if let Err(error) = result {
         error!("Failed to initialize connections: {error}");
-        return;
+        return Err(error);
     }
     info!("Initialized connections to all nodes");
     let (virtual_network, receiver_channel, read_tasks, send_loop_tasks) = result.unwrap();
@@ -58,7 +59,7 @@ async fn main() {
     let before_write = SystemTime::now();
     abd.write(1, 10 + config.my_node_id as u32).await.unwrap();
     let after_write = SystemTime::now();
-    info!(
+    println!(
         "Node {} wrote key {}: {} time: {}ms",
         config.my_node_id,
         1,
@@ -73,7 +74,7 @@ async fn main() {
         let before_read = SystemTime::now();
         let read = abd.read(node as u64).await.unwrap();
         let after_read = SystemTime::now();
-        info!(
+        println!(
             "Node {} read key {}: {} time: {}ms",
             config.my_node_id,
             node,
@@ -94,10 +95,14 @@ async fn main() {
     let read_result = reader_handles.into_iter().collect::<TryJoinAll<_>>().await;
     if let Err(error) = read_result {
         error!("Error encountered while reading: {error}");
+        return Err(error.into());
     }
 
     let send_result = sender_handles.into_iter().collect::<TryJoinAll<_>>().await;
     if let Err(error) = send_result {
         error!("Error encountered while sending: {error}");
+        return Err(error.into());
     }
+
+    Ok(())
 }
