@@ -45,7 +45,7 @@ async fn run() -> Result<()> {
         "Node {}: waiting 2s for everyone to connect",
         config.my_node_id
     );
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
     println!(
         "Node {}: experiment started at: {:.3}",
         config.my_node_id,
@@ -63,20 +63,20 @@ async fn run() -> Result<()> {
         after_write.duration_since(before_write)?.as_millis()
     );
 
-    for (node, _) in config.nodes {
+    for key in vec![1, 2]{
         let before_read = SystemTime::now();
-        let read = abd.read(node as u64).await?;
+        let read = abd.read(key).await?;
         let after_read = SystemTime::now();
         println!(
             "Node {} read key {}: {} time: {}ms",
             config.my_node_id,
-            node,
+            key,
             read,
             after_read.duration_since(before_read)?.as_millis()
         );
     }
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_secs(20)).await;
     info!("Initiated exit");
     quit.send(()).await?;
 
