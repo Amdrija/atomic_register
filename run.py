@@ -4,51 +4,48 @@ import tomllib
 import subprocess
 import sys
 import os
+import traceback
 
-# TODO: Add network delay configuration
 # TODO: Add support for arguments to run different builds, log_level, printing stderr and stdout to files etc.
 
 def configure_network_delays(config, delays):
-    rc = subprocess.run(["pfctl", "-E"])
-    rc = 0
-    if rc != 0:
-        print("failed to run: pfctl -E")
-        return rc
+    subprocess.run(["pfctl", "-E"], check=True)
 
     pipe_number = 1
     node_delay_pipes = {}
     for node, to_delays in delays.items():
         if node not in config:
-            print(f"Node {node} not in config")
-            return 1
+            raise Exception(f"Node {node} not in config")
 
         node_delay_pipes[node] = {}
         for to, delay in to_delays.items():
             if to not in config:
-                print(f"Node {to} not in config")
-                return 1
+                raise Exception(f"Node {to} not in config")
 
-#             rc = subprocess.run(["dnctl", "pipe", pipe_number, "config", "delay", delay])
-            print(["dnctl", "pipe", pipe_number, "config", "delay", delay])
-            rc = 0
-            if rc != 0:
-                return rc
+            rc = subprocess.run(["dnctl", "pipe", str(pipe_number), "config", "delay", str(delay)], check=True)
 
             node_delay_pipes[node][to] = pipe_number
             pipe_number += 1
-
+    subprocess.run(["dnctl", "show"])
     rules = ""
     for node, delay_pipes in node_delay_pipes.items():
-        src_address = config[node]["source"].replace(":", " port ")
+        node_src_address = config[node]["source"].replace(":", " port ")
+        node_dst_address = config[node]["destination"].replace(":", " port ")
         for to, pipe in delay_pipes.items():
-            dst_address = config[to]["destination"].replace(":", " port ")
-            rules += f"dummynet out proto tcp from {src_address} to port {dst_address} pipe 1\n"
-            rules += f"dummynet out proto tcp from {dst_address} to port {src_address} pipe 1\n"
+            to_src_address = config[to]["source"].replace(":", " port ")
+            to_dst_address = config[to]["destination"].replace(":", " port ")
+            rules += f"dummynet out proto tcp from {node_src_address} to {to_dst_address} pipe {pipe}\n"
+            rules += f"dummynet out proto tcp from {node_dst_address} to {to_src_address} pipe {pipe}\n"
     print(rules)
+    cmd = subprocess.Popen(["pfctl", "-a", "ts", "-f", "-"], stdin=subprocess.PIPE)
+    cmd.communicate(bytes(rules, "utf-8"))
+    cmd.wait()
+    if cmd.returncode != 0:
+        raise subprocess.CalledProcessError(cmd.returncode, cmd.args)
 
 def reset_network_config():
-    subprocess.run(["pfctl", "-a", "ts", "-F", "all"])
-    subprocess.run(["dnctl", "-q", "flush"])
+    subprocess.run(["pfctl", "-a", "ts", "-F", "all"], check = True)
+    subprocess.run(["dnctl", "-q", "flush"], check = True)
 
 mode = "debug"
 log_level = "info"
@@ -64,9 +61,10 @@ with open(delays_path, "rb") as delays_file:
     delays = tomllib.load(delays_file)
     print(f"Loaded delays {delays}")
 
-rc = configure_network_delays(config, delays)
-exit(0)
-if rc != 0:
+try:
+    configure_network_delays(config, delays)
+except Exception as e:
+    print(traceback.format_exc())
     reset_network_config()
     exit(1)
 

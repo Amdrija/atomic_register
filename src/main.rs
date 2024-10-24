@@ -1,10 +1,10 @@
-use std::process::exit;
 use crate::abd::ABD;
 use crate::config::Config;
 use crate::network::initialize_connections;
 use anyhow::Result;
 use futures::future::TryJoinAll;
 use log::{error, info};
+use std::process::exit;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -14,11 +14,13 @@ mod config;
 mod core;
 mod network;
 
-async fn run() -> Result<()> {info!("Started");
+async fn run() -> Result<()> {
+    info!("Started");
     let config = Config::new()?;
     info!("Finished parsing config: {:#?}", config);
 
-    let (virtual_network, receiver_channel, read_tasks, send_loop_tasks) = initialize_connections(&config).await?;
+    let (virtual_network, receiver_channel, read_tasks, send_loop_tasks) =
+        initialize_connections(&config).await?;
     info!("Initialized connections to all nodes");
 
     let reader_handles = read_tasks
@@ -43,27 +45,23 @@ async fn run() -> Result<()> {info!("Started");
         "Node {}: waiting 2s for everyone to connect",
         config.my_node_id
     );
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
     println!(
         "Node {}: experiment started at: {:.3}",
         config.my_node_id,
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64()
     );
 
-    if config.my_node_id == 2 {
-        let before_write = SystemTime::now();
-        abd.write(1, 10 + config.my_node_id as u32).await?;
-        let after_write = SystemTime::now();
-        println!(
-            "Node {} wrote key {}: {} time: {}ms",
-            config.my_node_id,
-            1,
-            10 + config.my_node_id as u32,
-            after_write
-                .duration_since(before_write)?
-                .as_millis()
-        );
-    }
+    let before_write = SystemTime::now();
+    abd.write(1, 10 + config.my_node_id as u32).await?;
+    let after_write = SystemTime::now();
+    println!(
+        "Node {} wrote key {}: {} time: {}ms",
+        config.my_node_id,
+        1,
+        10 + config.my_node_id as u32,
+        after_write.duration_since(before_write)?.as_millis()
+    );
 
     for (node, _) in config.nodes {
         let before_read = SystemTime::now();
@@ -87,8 +85,18 @@ async fn run() -> Result<()> {info!("Started");
     receive_loop_handle.await?;
     drop(abd);
 
-    reader_handles.into_iter().collect::<TryJoinAll<_>>().await?.into_iter().collect::<Result<_>>()?;
-    sender_handles.into_iter().collect::<TryJoinAll<_>>().await?.into_iter().collect::<Result<_>>()?;
+    reader_handles
+        .into_iter()
+        .collect::<TryJoinAll<_>>()
+        .await?
+        .into_iter()
+        .collect::<Result<_>>()?;
+    sender_handles
+        .into_iter()
+        .collect::<TryJoinAll<_>>()
+        .await?
+        .into_iter()
+        .collect::<Result<_>>()?;
 
     Ok(())
 }
