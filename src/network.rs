@@ -20,6 +20,9 @@ use tokio::{
     sync::mpsc::{Receiver, Sender},
 };
 
+type MessageLen = u32;
+const READ_BUFFER_SIZE: usize = 100;
+
 pub async fn initialize_connections<T>(
     config: &Config,
 ) -> Result<(
@@ -107,8 +110,8 @@ where
             .with_context(|| format!("Failed to serialize packet: {:#?}", packet))?;
         debug!(
             "Node {} sending data to {}",
-            stream.local_addr().unwrap(),
-            stream.peer_addr().unwrap()
+            stream.local_addr()?,
+            stream.peer_addr()?
         );
         stream
             .write(&serialized)
@@ -129,11 +132,11 @@ where
         + for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, Error>>,
 {
     let payload = rkyv::to_bytes::<Error>(payload)?;
-    let len = payload.len();
-    let mut bytes = vec![len as u8];
+    let len = payload.len() as MessageLen;
+    let mut bytes = rkyv::to_bytes::<Error>(&len)?;
     bytes.extend_from_slice(payload.as_slice());
 
-    Ok(bytes)
+    Ok(bytes.to_vec())
 }
 
 pub async fn initialize_recv<T>(
@@ -178,13 +181,15 @@ where
 {
     info!(
         "Started reading from {} to {}",
-        stream.peer_addr().unwrap(),
-        stream.local_addr().unwrap()
+        stream.peer_addr()?,
+        stream.local_addr()?
     );
-    let mut len_left = 0u8;
+
+    let mut len_bytes = Vec::new();
+    let mut len_left = 0 as MessageLen;
     let mut payload = Vec::new();
     loop {
-        let mut buffer = [0u8; 100];
+        let mut buffer = [0u8; READ_BUFFER_SIZE];
         let n = stream.read(&mut buffer).await?;
         if n == 0 {
             info!("Node {to} closed stream from node {from}");
@@ -192,12 +197,13 @@ where
         }
         debug!(
             "node {} received data from {}",
-            stream.local_addr().unwrap(),
-            stream.peer_addr().unwrap()
+            stream.local_addr()?,
+            stream.peer_addr()?
         );
+
         let (packets, new_len_left) =
-            read_packets_from_buffer(&buffer, n, len_left as usize, &mut payload)?;
-        len_left = new_len_left as u8;
+            read_packets_from_buffer(&buffer, n, len_left, &mut len_bytes, &mut payload)?;
+        len_left = new_len_left;
         for packet in packets {
             sender
                 .send(Packet {
@@ -215,9 +221,10 @@ where
 fn read_packets_from_buffer<T>(
     buffer: &[u8],
     n: usize,
-    mut len_left: usize,
+    mut len_left: MessageLen,
+    len_bytes: &mut Vec<u8>,
     payload: &mut Vec<u8>,
-) -> Result<(Vec<T>, usize)>
+) -> Result<(Vec<T>, MessageLen)>
 where
     T: Debug + Send + Sync + 'static + Archive,
     T::Archived:
@@ -226,20 +233,31 @@ where
     let mut packets = Vec::new();
     let mut i = 0;
     while i < n {
-        if len_left == 0 {
-            len_left = buffer[i] as usize;
+        //So, if len_left == 0, that means that we have to read
+        //the len from the next bytes from the network until we have
+        // enough bytes in len_bytes to parse the length of the packet
+        if len_left == 0 && len_bytes.len() < size_of::<MessageLen>() {
+            len_bytes.push(buffer[i]);
             i += 1;
+            continue;
         }
 
-        if n - i >= len_left {
-            payload.extend_from_slice(&buffer[i..i + len_left]);
+        // Now, if len_left is 0, but there's enough bytes read in len_bytes
+        // to parse the length, we can parse it, and then continue reading the packet
+        if len_left == 0 && len_bytes.len() == size_of::<MessageLen>() {
+            len_left = rkyv::from_bytes::<MessageLen, Error>(&len_bytes)?;
+            len_bytes.clear();
+        }
+
+        if n - i >= len_left as usize {
+            payload.extend_from_slice(&buffer[i..i + len_left as usize]);
             packets.push(rkyv::from_bytes::<T, Error>(&payload)?);
             payload.clear();
-            i += len_left;
+            i += len_left as usize;
             len_left = 0;
         } else {
             payload.extend_from_slice(&buffer[i..n]);
-            len_left -= n - i;
+            len_left -= (n - i) as MessageLen;
             i = n;
         }
     }
@@ -250,7 +268,10 @@ where
 #[cfg(test)]
 mod test {
     use crate::core::Packet;
-    use crate::network::{initialize_recv, initialize_send, read_packets_from_buffer, serialize};
+    use crate::network::{
+        initialize_recv, initialize_send, read_packets_from_buffer, serialize, MessageLen,
+        READ_BUFFER_SIZE,
+    };
     use rkyv::rancor::Error;
     use rkyv::{Archive, Deserialize, Serialize};
     use std::collections::HashMap;
@@ -298,10 +319,13 @@ mod test {
                 let (mut stream, address) = listener.accept().await.unwrap();
                 assert_eq!(address, sender_address);
 
-                let mut buffer = [0u8; 100];
+                let mut buffer = [0u8; READ_BUFFER_SIZE];
                 let _n = stream.read(&mut buffer).await.unwrap();
-                let len = buffer[0] as usize;
-                let data = Vec::from(&buffer[1..len + 1]);
+                let len = rkyv::from_bytes::<MessageLen, Error>(&buffer[..size_of::<MessageLen>()])
+                    .unwrap();
+                let data = Vec::from(
+                    &buffer[size_of::<MessageLen>()..len as usize + size_of::<MessageLen>()],
+                );
                 assert_eq!(
                     payload,
                     rkyv::from_bytes::<TestPayload, Error>(&data).unwrap()
@@ -356,8 +380,14 @@ mod test {
         assert!(bytes.is_ok());
         let bytes = bytes.unwrap();
 
-        assert_eq!(bytes[0] as usize, bytes.len() - 1);
-        let bytes = Vec::from(&bytes[1..]);
+        for k in 0..size_of::<MessageLen>() - 1 {
+            assert_eq!(bytes[k], 0);
+        }
+        assert_eq!(
+            bytes[size_of::<MessageLen>() - 1] as usize,
+            bytes.len() - size_of::<MessageLen>()
+        );
+        let bytes = Vec::from(&bytes[size_of::<MessageLen>()..]);
         let deserialized = rkyv::from_bytes::<TestPayload, Error>(&bytes);
         assert!(deserialized.is_ok());
         assert_eq!(deserialized.unwrap(), payload);
@@ -467,10 +497,13 @@ mod test {
         let mut payload = serialize(&payload1).unwrap();
         payload.append(&mut serialize(&payload2).unwrap());
 
-        let result = read_packets_from_buffer(&payload, payload.len(), 0, &mut Vec::new());
+        let mut len_bytes = Vec::new();
+
+        let result =
+            read_packets_from_buffer(&payload, payload.len(), 0, &mut len_bytes, &mut Vec::new());
         assert!(result.is_ok());
 
-        let (packets, len_left): (Vec<TestPayload>, usize) = result.unwrap();
+        let (packets, len_left): (Vec<TestPayload>, MessageLen) = result.unwrap();
         assert_eq!(len_left, 0);
         assert!(packets.iter().eq(vec![payload1, payload2].iter()));
     }
@@ -479,25 +512,72 @@ mod test {
     fn test_read_packets_from_buffer_split_packet() {
         let payload = TestPayload {
             id: 1,
-            str: String::from_utf8(vec![65; 150]).unwrap(),
+            str: String::from_utf8(vec![65; 2 * READ_BUFFER_SIZE]).unwrap(),
         };
 
         let buffer = serialize(&payload).unwrap();
 
         let mut current_read = Vec::new();
-        let result = read_packets_from_buffer(&buffer[..100], 100, 0, &mut current_read);
-        assert!(result.is_ok());
-        let (packets, len_left): (Vec<TestPayload>, usize) = result.unwrap();
-        assert_eq!(packets.len(), 0);
-
+        let mut len_bytes = Vec::new();
         let result = read_packets_from_buffer(
-            &buffer[100..],
-            buffer.len() - 100,
-            len_left,
+            &buffer[..READ_BUFFER_SIZE],
+            READ_BUFFER_SIZE,
+            0,
+            &mut len_bytes,
             &mut current_read,
         );
         assert!(result.is_ok());
-        let (packets, len_left): (Vec<TestPayload>, usize) = result.unwrap();
+        let (packets, len_left): (Vec<TestPayload>, MessageLen) = result.unwrap();
+        assert_eq!(packets.len(), 0);
+
+        let result = read_packets_from_buffer(
+            &buffer[READ_BUFFER_SIZE..],
+            buffer.len() - READ_BUFFER_SIZE,
+            len_left,
+            &mut len_bytes,
+            &mut current_read,
+        );
+        assert!(result.is_ok());
+        let (packets, len_left): (Vec<TestPayload>, MessageLen) = result.unwrap();
+        assert_eq!(len_left, 0);
+        assert!(packets.iter().eq(vec![payload].iter()));
+    }
+    #[test]
+    fn test_read_packets_from_buffer_split_len() {
+        let payload = TestPayload {
+            id: 1,
+            str: String::from_utf8(vec![65; READ_BUFFER_SIZE]).unwrap(),
+        };
+
+        let buffer = serialize(&payload).unwrap();
+
+        let mut current_read = Vec::new();
+        let mut len_bytes = Vec::new();
+        let len_left = 0;
+        for k in 0..size_of::<MessageLen>() {
+            let result = read_packets_from_buffer(
+                &buffer[k..k + 1],
+                1,
+                len_left,
+                &mut len_bytes,
+                &mut current_read,
+            );
+            assert!(result.is_ok());
+            let (packets, len_left): (Vec<TestPayload>, MessageLen) = result.unwrap();
+            assert_eq!(packets.len(), 0);
+            assert_eq!(len_left, 0);
+            assert_eq!(len_bytes.len(), k + 1);
+        }
+
+        let result = read_packets_from_buffer(
+            &buffer[size_of::<MessageLen>()..],
+            buffer.len() - size_of::<MessageLen>(),
+            len_left,
+            &mut len_bytes,
+            &mut current_read,
+        );
+        assert!(result.is_ok());
+        let (packets, len_left): (Vec<TestPayload>, MessageLen) = result.unwrap();
         assert_eq!(len_left, 0);
         assert!(packets.iter().eq(vec![payload].iter()));
     }

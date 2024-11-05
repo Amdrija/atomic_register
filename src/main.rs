@@ -90,13 +90,13 @@ async fn run() -> Result<()> {
         .collect::<TryJoinAll<_>>()
         .await?
         .into_iter()
-        .collect::<Result<_>>()?;
+        .collect::<Result<()>>()?;
     sender_handles
         .into_iter()
         .collect::<TryJoinAll<_>>()
         .await?
         .into_iter()
-        .collect::<Result<_>>()?;
+        .collect::<Result<()>>()?;
 
     Ok(())
 }
