@@ -13,6 +13,7 @@ mod abd;
 mod config;
 mod core;
 mod network;
+mod paxos;
 
 async fn run() -> Result<()> {
     info!("Started");
@@ -63,7 +64,7 @@ async fn run() -> Result<()> {
         after_write.duration_since(before_write)?.as_millis()
     );
 
-    for key in vec![1, 2]{
+    for key in vec![1, 2] {
         let before_read = SystemTime::now();
         let read = abd.read(key).await?;
         let after_read = SystemTime::now();
