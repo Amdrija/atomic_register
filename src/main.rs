@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 mod abd;
 mod config;
 mod core;
+mod multipaxos;
 mod network;
 mod paxos;
 
