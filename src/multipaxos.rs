@@ -442,6 +442,9 @@ impl Multipaxos {
             state.set_log(index, INFINITE_PROPOSAL.clone(), command_to_propose.clone());
         }
 
+        // TODO: Add uuid's for commands so you can compare them?
+        // TODO: Figure out if we want to actually compare commands by semantics
+        // Or by ID - probably ID
         if command_to_propose != command {
             return bail!("The proposal slot {} is taken, try again", index);
         }
@@ -538,41 +541,50 @@ impl Multipaxos {
                 no_more_accepted: state.no_more_accepted(prepare_message.index),
             };
 
-            debug!(
-                "Node {} sending promise messagee {:?} to {}",
-                self.network.node, promise_message, from
-            );
             self.network
                 .send(from, Message::Promise(promise_message))
                 .await
                 .unwrap();
+            debug!(
+                "Node {} sent promise message {:?} to {}",
+                self.network.node, promise_message, from
+            );
         } else {
             let reject_message = RejectPrepareMessage {
                 proposal_number: state.min_promised_proposal.clone(),
             };
 
-            debug!(
-                "Node {} rejecting prepare message {:?} from {}",
-                self.network.node, prepare_message, from
-            );
             self.network
                 .send(from, Message::RejectPrepare(reject_message))
                 .await
                 .unwrap();
+            debug!(
+                "Node {} rejected prepare message {:?} from {}",
+                self.network.node, prepare_message, from
+            );
         }
     }
 
-    async fn process_reject_prepare(&self, reject_prepare_message: RejectPrepareMessage) {
+    async fn process_reject_prepare(
+        &self,
+        reject_prepare_message: RejectPrepareMessage,
+        from: NodeId,
+    ) {
+        debug!(
+            "Node {} received reject prepare {:?} from {}",
+            self.network.node, reject_prepare_message
+        );
         let mut state = self.state.lock().await;
         if state.current_proposal < reject_prepare_message.proposal_number {
             state.fail_prepare_phase();
+            debug!("Node {} failed prepare phase", self.network.node);
         }
     }
 
-    async fn process_promise(&self, promise_message: PromiseMessage) {
+    async fn process_promise(&self, promise_message: PromiseMessage, from: NodeId) {
         debug!(
-            "Node {} received promise message {:?}",
-            self.network.node, promise_message
+            "Node {} received promise message {:?} from {}",
+            self.network.node, promise_message, from
         );
         let mut state = self.state.lock().await;
         if promise_message.proposal_number == state.current_proposal {
@@ -588,16 +600,12 @@ impl Multipaxos {
         let mut state = self.state.lock().await;
         let accept_message = state.accept_or_reject_proposal(propose_message);
 
-        debug!(
-            "1 Node {} sent accept {:?} to {}",
-            self.network.node, accept_message, from
-        );
         self.network
             .send(from, Message::Accept(accept_message.clone()))
             .await
             .unwrap();
         debug!(
-            "2 Node {} sent accept {:?} to {}",
+            "Node {} sent accept {:?} to {}",
             self.network.node, accept_message, from
         );
     }
@@ -619,18 +627,19 @@ impl Multipaxos {
                     command: chosen_entry.command,
                 };
 
-                debug!(
-                    "Node {} sending success message {:?} to {}",
-                    self.network.node, success_message, from
-                );
                 self.network
                     .send(from, Message::Success(success_message))
                     .await
                     .unwrap();
+                debug!(
+                    "Node {} sent success message {:?} to {}",
+                    self.network.node, success_message, from
+                );
             }
             if state.accept_acks == state.majority_threshold {
                 if let Some(finish_accept) = state.finish_accept.take() {
-                    finish_accept.send(()).unwrap()
+                    finish_accept.send(()).unwrap();
+                    debug!("Node {} finished accept phase", self.network.node);
                 }
             }
         }
@@ -653,9 +662,13 @@ impl Multipaxos {
         };
 
         self.network
-            .send(from, Message::SuccessResponse(success_response))
+            .send(from, Message::SuccessResponse(success_response.clone()))
             .await
-            .unwrap()
+            .unwrap();
+        debug!(
+            "Node {} sent success response {:?} to {}",
+            self.network.node, success_response, from
+        );
     }
 
     async fn process_success_response(
@@ -682,9 +695,14 @@ impl Multipaxos {
             };
 
             self.network
-                .send(from, Message::Success(success_message))
+                .send(from, Message::Success(success_message.clone()))
                 .await
-                .unwrap()
+                .unwrap();
+
+            debug!(
+                "Node {} sent success {:?} to {}",
+                self.network.node, success_message, from
+            );
         }
     }
 }
@@ -747,5 +765,9 @@ mod test {
         spawned_tasks.into_iter().collect::<JoinAll<_>>().await;
 
         assert!(false);
+
+        // TODO: Implement proper test
     }
+
+    // TODO: Implement more tests?
 }

@@ -17,6 +17,9 @@ mod network;
 mod paxos;
 
 async fn run() -> Result<()> {
+    // TODO: Implement Multipaxos
+    // TODO: Maybe figure out if we want it to be a separate binary -> one per algorithm?
+    // TODO: Set up tokio so that if any of the tasks panic, the whole process exits? Same thing for tests
     info!("Started");
     let config = Config::new()?;
     info!("Finished parsing config: {:#?}", config);
