@@ -7,8 +7,8 @@ use std::cmp::min;
 use std::future::Future;
 use std::ops::Deref;
 use std::os::macos::raw::stat;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -50,7 +50,7 @@ struct PromiseMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive)]
 struct RejectPrepareMessage {
-    proposal_number: ProposalNumber
+    proposal_number: ProposalNumber,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive)]
@@ -115,16 +115,13 @@ struct MultipaxosState {
     current_proposal: ProposalNumber,
     promises: Vec<PromiseMessage>,
     finish_prepare: Option<oneshot::Sender<Option<LogEntry>>>,
-    accept_acks: NodeId,
-    finish_accept: Option<oneshot::Sender<()>>
+    accept_acks: usize,
+    finish_accept: Option<oneshot::Sender<()>>,
 }
 
 impl MultipaxosState {
     fn new(node: NodeId, node_count: usize) -> Self {
-        let zero_proposal = ProposalNumber {
-            round: 0,
-            node,
-        };
+        let zero_proposal = ProposalNumber { round: 0, node };
 
         Self {
             node,
@@ -143,7 +140,7 @@ impl MultipaxosState {
             promises: vec![],
             finish_prepare: None,
             accept_acks: 0,
-            finish_accept: None
+            finish_accept: None,
         }
     }
 
@@ -166,7 +163,7 @@ impl MultipaxosState {
         self.max_round += 1;
         let proposal_number = ProposalNumber {
             round: self.max_round,
-            node: self.node
+            node: self.node,
         };
         self.current_proposal = proposal_number.clone();
 
@@ -175,10 +172,13 @@ impl MultipaxosState {
         let (send, recv) = oneshot::channel();
         self.finish_prepare.replace(send);
 
-        (PrepareMessage {
-            proposal_number,
-            index,
-        }, recv)
+        (
+            PrepareMessage {
+                proposal_number,
+                index,
+            },
+            recv,
+        )
     }
 
     fn skip_prepare_state(&mut self) -> usize {
@@ -211,10 +211,15 @@ impl MultipaxosState {
         self.promises.push(promise_message);
         if self.promises.len() == self.majority_threshold {
             if let Some(finish_prepare) = self.finish_prepare.take() {
-                let highest_accepted = self.promises.iter().filter_map(|promise| promise.accepted.clone()).max_by_key(|entry| entry.proposal_number.clone());
+                let highest_accepted = self
+                    .promises
+                    .iter()
+                    .filter_map(|promise| promise.accepted.clone())
+                    .max_by_key(|entry| entry.proposal_number.clone());
                 match finish_prepare.send(highest_accepted) {
                     Ok(_) => {
-                        self.prepared = self.promises.iter().all(|promise| promise.no_more_accepted);
+                        self.prepared =
+                            self.promises.iter().all(|promise| promise.no_more_accepted);
                     }
                     Err(_) => {
                         info!("Node {} failed to finish prepare phase because nobody listening in the issue command function - prepare already finished", self.node);
@@ -224,27 +229,71 @@ impl MultipaxosState {
         }
     }
 
-    fn go_to_accept_phase(&mut self, index: usize, command: Command) -> (ProposeMessage, oneshot::Receiver<()>) {
+    fn go_to_accept_phase(
+        &mut self,
+        index: usize,
+        command: Command,
+    ) -> (ProposeMessage, oneshot::Receiver<()>) {
         let (accept_send, accept_recv) = oneshot::channel();
         self.finish_accept.replace(accept_send);
         self.accept_acks = 0;
 
-        (ProposeMessage {
-            proposal_number: self.current_proposal.clone(),
-            index,
-            command,
-            first_unchosen_index: self.first_unchosen_index(),
-        }, accept_recv)
+        (
+            ProposeMessage {
+                proposal_number: self.current_proposal.clone(),
+                index,
+                command,
+                first_unchosen_index: self.first_unchosen_index(),
+            },
+            accept_recv,
+        )
     }
 
-    fn set_log(
-        &mut self,
-        index: usize,
-        proposal_number: ProposalNumber,
-        command: Command,
-    ) {
+    fn accept_or_reject_proposal(&mut self, propose_message: ProposeMessage) -> AcceptMessage {
+        if propose_message.proposal_number >= self.min_promised_proposal {
+            self.min_promised_proposal = propose_message.proposal_number.clone();
+            self.set_log(
+                propose_message.index,
+                propose_message.proposal_number.clone(),
+                propose_message.command,
+            );
+            self.set_chosen_up_to(propose_message.index, &propose_message.proposal_number);
+        }
+
+        AcceptMessage {
+            proposal_number: self.min_promised_proposal.clone(),
+            first_unchosen_index: self.first_unchosen_index(),
+        }
+    }
+
+    fn process_rejected_proposal(&mut self, accepted_round: u64) {
+        self.max_round = accepted_round;
+        self.prepared = false;
+        if let Some(finish_accept) = self.finish_accept.take() {
+            self.accept_acks = 0;
+            drop(finish_accept); // This will error the receiving side
+        }
+    }
+
+    fn get_chosen_entry(&self, index: usize) -> Option<LogEntry> {
+        self.log
+            .get(index)
+            .map(|entry| {
+                entry.clone().map(|entry| {
+                    if entry.proposal_number == INFINITE_PROPOSAL {
+                        Some(entry)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .flatten()
+            .flatten()
+    }
+
+    fn set_log(&mut self, index: usize, proposal_number: ProposalNumber, command: Command) {
         if index >= self.log.len() {
-            self.log.reserve(index - self.log.len() + 1);
+            self.log.resize(index + 1, None);
         }
         self.log[index] = Some(LogEntry {
             proposal_number,
@@ -252,8 +301,23 @@ impl MultipaxosState {
         });
     }
 
+    fn set_chosen_up_to(&mut self, index: usize, proposal_number: &ProposalNumber) {
+        if index > self.log.len() {
+            return;
+        }
+
+        self.log[..index].iter_mut().for_each(|entry| {
+            if let Some(entry) = entry {
+                if entry.proposal_number == *proposal_number {
+                    entry.proposal_number = INFINITE_PROPOSAL.clone();
+                }
+            }
+        });
+    }
+
     fn first_unchosen_index(&self) -> usize {
-        self.log.iter()
+        self.log
+            .iter()
             .enumerate()
             .find(|(index, entry)| {
                 entry.is_some() && entry.as_ref().unwrap().proposal_number < INFINITE_PROPOSAL
@@ -267,7 +331,7 @@ struct Multipaxos {
     network: VirtualNetwork<Message>,
     heartbeat_delay: Duration,
     state: Arc<Mutex<MultipaxosState>>,
-    cancellation_token: CancellationToken
+    cancellation_token: CancellationToken,
 }
 
 impl Multipaxos {
@@ -283,7 +347,7 @@ impl Multipaxos {
             network: virtual_network,
             heartbeat_delay,
             state: Arc::new(Mutex::new(MultipaxosState::new(node, nodes))),
-            cancellation_token: CancellationToken::new()
+            cancellation_token: CancellationToken::new(),
         });
 
         let multipaxos_clone = multipaxos.clone();
@@ -314,7 +378,7 @@ impl Multipaxos {
     // because the prepare phase will have to run for all,
     // and then they will potentially live-lock each other
     pub async fn issue_command(&self, command: Command) -> Result<()> {
-        let prepared =  {
+        let prepared = {
             let mut state = self.state.lock().await;
 
             if !state.am_i_leader() {
@@ -331,34 +395,62 @@ impl Multipaxos {
             };
             let index = prepare_message.index;
 
-            self.network.broadcast(Message::Prepare(prepare_message)).await?;
+            self.network
+                .broadcast(Message::Prepare(prepare_message))
+                .await?;
 
             // If this await fails, that means that the send side was dropped
             // This is only possible if the prepare message was rejected by a node
-            let accepted_entry = prepare_finished.await.with_context(|| "Prepare rejected from a node, try again")?;
+            let accepted_entry = prepare_finished
+                .await
+                .with_context(|| "Prepare rejected from a node, try again")?;
 
             info!("Node {} prepare successful", self.network.node);
 
-            (index, accepted_entry.map(|entry| entry.command).unwrap_or(command.clone()))
+            (
+                index,
+                accepted_entry
+                    .map(|entry| entry.command)
+                    .unwrap_or(command.clone()),
+            )
         } else {
             let mut state = self.state.lock().await;
             info!("Node {} skipping prepare state", self.network.node);
             (state.skip_prepare_state(), command.clone())
         };
 
-        return Ok(());
+        let (propose_message, accept_finished) = {
+            let mut state = self.state.lock().await;
+            state.go_to_accept_phase(index, command_to_propose.clone())
+        };
 
         // TODO: Implement accept phase
-        // let (propose_message, accept_finished) = state.go_to_accept_phase(index, command_to_propose.clone());
-        // self.network.broadcast(Message::Propose(propose_message)).await?;
-        //
-        // accept_finished.await.with_context(|| "Proposal rejected from a node, try again")?;
-        //
-        // if command_to_propose != command {
-        //     return bail!("The proposal slot {} is taken, try again", index);
-        // }
-        //
-        // Ok(())
+        let (propose_message, accept_finished) = {
+            let mut state = self.state.lock().await;
+            state.go_to_accept_phase(index, command_to_propose.clone())
+        };
+        self.network
+            .broadcast(Message::Propose(propose_message))
+            .await?;
+
+        accept_finished
+            .await
+            .with_context(|| "Proposal rejected from a node, try again")?;
+
+        {
+            let mut state = self.state.lock().await;
+            state.set_log(index, INFINITE_PROPOSAL.clone(), command_to_propose.clone());
+        }
+
+        if command_to_propose != command {
+            return bail!("The proposal slot {} is taken, try again", index);
+        }
+
+        Ok(())
+    }
+
+    pub async fn get_log(&self) -> Vec<Option<LogEntry>> {
+        self.state.lock().await.log.clone()
     }
 
     pub fn quit(&self) {
@@ -383,7 +475,7 @@ impl Multipaxos {
                         Message::Propose(propose) => {self.process_propose(propose, packet.from).await}
                         Message::Accept(accept) => {self.process_accept(accept, packet.from).await}
                         Message::Success(success) => {self.process_success(success, packet.from).await}
-                        Message::SuccessResponse(success_response) => {self.process_success_ressponse(success_response, packet.from).await}
+                        Message::SuccessResponse(success_response) => {self.process_success_response(success_response, packet.from).await}
                     };
                 }
                 _ = self.cancellation_token.cancelled() => {
@@ -427,14 +519,16 @@ impl Multipaxos {
     }
 
     async fn process_heartbeat(&self, from: NodeId) {
-        //TODO: Implement
         debug!("Node {} received heartbeat from {from}", self.network.node);
         let mut state = self.state.lock().await;
         state.heard_from.push(from);
     }
 
     async fn process_prepare(&self, prepare_message: PrepareMessage, from: NodeId) {
-        debug!("Node {} processing prepare message {:?} from {}", self.network.node, prepare_message, from);
+        debug!(
+            "Node {} processing prepare message {:?} from {}",
+            self.network.node, prepare_message, from
+        );
         let mut state = self.state.lock().await;
         if prepare_message.proposal_number >= state.min_promised_proposal {
             let accepted = state.promise(&prepare_message);
@@ -444,13 +538,27 @@ impl Multipaxos {
                 no_more_accepted: state.no_more_accepted(prepare_message.index),
             };
 
-            debug!("Node {} sending promise messagee {:?} to {}", self.network.node, promise_message, from);
-            self.network.send(from, Message::Promise(promise_message)).await.unwrap();
+            debug!(
+                "Node {} sending promise messagee {:?} to {}",
+                self.network.node, promise_message, from
+            );
+            self.network
+                .send(from, Message::Promise(promise_message))
+                .await
+                .unwrap();
         } else {
-            let reject_message = RejectPrepareMessage { proposal_number: state.min_promised_proposal.clone() };
+            let reject_message = RejectPrepareMessage {
+                proposal_number: state.min_promised_proposal.clone(),
+            };
 
-            debug!("Node {} rejecting prepare message {:?} from {}", self.network.node, prepare_message, from);
-            self.network.send(from, Message::RejectPrepare(reject_message)).await.unwrap();
+            debug!(
+                "Node {} rejecting prepare message {:?} from {}",
+                self.network.node, prepare_message, from
+            );
+            self.network
+                .send(from, Message::RejectPrepare(reject_message))
+                .await
+                .unwrap();
         }
     }
 
@@ -462,7 +570,10 @@ impl Multipaxos {
     }
 
     async fn process_promise(&self, promise_message: PromiseMessage) {
-        debug!("Node {} received promise message {:?}", self.network.node, promise_message);
+        debug!(
+            "Node {} received promise message {:?}",
+            self.network.node, promise_message
+        );
         let mut state = self.state.lock().await;
         if promise_message.proposal_number == state.current_proposal {
             state.process_promise(promise_message);
@@ -470,23 +581,111 @@ impl Multipaxos {
     }
 
     async fn process_propose(&self, propose_message: ProposeMessage, from: NodeId) {
+        debug!(
+            "Node {} received propose message {:?} from {}",
+            self.network.node, propose_message, from
+        );
+        let mut state = self.state.lock().await;
+        let accept_message = state.accept_or_reject_proposal(propose_message);
 
+        debug!(
+            "1 Node {} sent accept {:?} to {}",
+            self.network.node, accept_message, from
+        );
+        self.network
+            .send(from, Message::Accept(accept_message.clone()))
+            .await
+            .unwrap();
+        debug!(
+            "2 Node {} sent accept {:?} to {}",
+            self.network.node, accept_message, from
+        );
     }
 
     async fn process_accept(&self, accept_message: AcceptMessage, from: NodeId) {
-        // TODO: Implement
+        debug!(
+            "Node {} received accept message {:?} from {}",
+            self.network.node, accept_message, from
+        );
+        let mut state = self.state.lock().await;
+        if accept_message.proposal_number > state.current_proposal {
+            state.process_rejected_proposal(accept_message.proposal_number.round);
+        } else if accept_message.proposal_number == state.current_proposal {
+            state.accept_acks += 1;
+            if let Some(chosen_entry) = state.get_chosen_entry(accept_message.first_unchosen_index)
+            {
+                let success_message = SuccessMessage {
+                    index: accept_message.first_unchosen_index,
+                    command: chosen_entry.command,
+                };
+
+                debug!(
+                    "Node {} sending success message {:?} to {}",
+                    self.network.node, success_message, from
+                );
+                self.network
+                    .send(from, Message::Success(success_message))
+                    .await
+                    .unwrap();
+            }
+            if state.accept_acks == state.majority_threshold {
+                if let Some(finish_accept) = state.finish_accept.take() {
+                    finish_accept.send(()).unwrap()
+                }
+            }
+        }
     }
 
     async fn process_success(&self, success_message: SuccessMessage, from: NodeId) {
-        // TODO: Implement
+        debug!(
+            "Node {} got success message {:?} from {}",
+            self.network.node, success_message, from
+        );
+        let mut state = self.state.lock().await;
+        state.set_log(
+            success_message.index,
+            INFINITE_PROPOSAL.clone(),
+            success_message.command,
+        );
+
+        let success_response = SuccessResponseMessage {
+            first_unchosen_index: state.first_unchosen_index(),
+        };
+
+        self.network
+            .send(from, Message::SuccessResponse(success_response))
+            .await
+            .unwrap()
     }
 
-    async fn process_success_ressponse(
+    async fn process_success_response(
         &self,
         success_response_message: SuccessResponseMessage,
         from: NodeId,
     ) {
-        // TODO: Implement
+        debug!(
+            "Node {} got success response {:?} from {}",
+            self.network.node, success_response_message, from
+        );
+        let mut state = self.state.lock().await;
+        if success_response_message.first_unchosen_index < state.first_unchosen_index() {
+            let success_message = SuccessMessage {
+                index: success_response_message.first_unchosen_index,
+                command: state
+                    .log
+                    .get(success_response_message.first_unchosen_index)
+                    .cloned()
+                    .unwrap()
+                    .unwrap()
+                    .command
+                    .clone(),
+            };
+
+            self.network
+                .send(from, Message::Success(success_message))
+                .await
+                .unwrap()
+        }
     }
 }
 
@@ -522,16 +721,26 @@ mod test {
 
         tokio::time::sleep(Duration::from_millis(2100)).await;
 
-        let result = multipaxoses[&2].issue_command(Command::Write(WriteCommand{
-            key: 1,
-            value: 10
-        })).await;
+        let result = multipaxoses[&2]
+            .issue_command(Command::Write(WriteCommand { key: 1, value: 10 }))
+            .await;
+
+        info!("*********** Result {:?}", result);
+
+        let result = multipaxoses[&2]
+            .issue_command(Command::Write(WriteCommand { key: 2, value: 12 }))
+            .await;
 
         info!("*********** Result {:?}", result);
 
         assert!(result.is_ok());
 
         for node in &nodes {
+            println!(
+                "Node {} log: {:?}",
+                node,
+                multipaxoses[node].get_log().await
+            );
             multipaxoses[node].quit();
         }
 
