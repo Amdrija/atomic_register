@@ -87,6 +87,19 @@ struct SuccessResponseMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive)]
+struct ReadMessage {
+    id: u64,
+    chosen_sequence_end: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Archive)]
+struct ReadResponseMessage {
+    id: u64,
+    chosen_sequence_end: usize,
+    missing_committed_entries: Vec<LogEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Archive)]
 enum Message {
     Heartbeat,
     Prepare(PrepareMessage),
@@ -96,9 +109,11 @@ enum Message {
     Accept(AcceptMessage),
     Success(SuccessMessage),
     SuccessResponse(SuccessResponseMessage),
+    Read(ReadMessage),
+    ReadResponse(ReadResponseMessage),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Archive)]
+#[derive(Debug, Clone, Serialize, Deserialize, Archive, PartialEq, Eq)]
 struct LogEntry {
     proposal_number: ProposalNumber,
     command: Command,
@@ -124,6 +139,10 @@ struct MultipaxosState {
     finish_prepare: Option<oneshot::Sender<Option<LogEntry>>>,
     accept_acks: usize,
     finish_accept: Option<oneshot::Sender<()>>,
+    next_read_id: u64,
+    current_read_id: u64,
+    read_responses: Vec<Vec<LogEntry>>,
+    finish_read: Option<oneshot::Sender<bool>>,
 }
 
 impl MultipaxosState {
@@ -152,6 +171,10 @@ impl MultipaxosState {
             finish_prepare: None,
             accept_acks: 0,
             finish_accept: None,
+            next_read_id: 1,
+            current_read_id: 0,
+            read_responses: vec![],
+            finish_read: None,
         }
     }
 
@@ -286,6 +309,63 @@ impl MultipaxosState {
         }
     }
 
+    fn go_to_read_phase(
+        &mut self,
+        chosen_sequence_end: usize,
+    ) -> (ReadMessage, oneshot::Receiver<bool>) {
+        let read_message = ReadMessage {
+            id: self.next_read_id,
+            chosen_sequence_end,
+        };
+        self.next_read_id += 1;
+
+        self.read_responses.clear();
+        self.current_read_id = read_message.id;
+
+        let (finish_read_send, finish_read_recv) = oneshot::channel();
+        self.finish_read.replace(finish_read_send);
+
+        (read_message, finish_read_recv)
+    }
+
+    fn process_read_response(&mut self, read_response_message: ReadResponseMessage) {
+        if self.current_read_id == read_response_message.id {
+            self.read_responses
+                .push(read_response_message.missing_committed_entries);
+
+            if self.read_responses.len() == self.majority_threshold {
+                let all_equal = self.all_responses_equal();
+
+                if all_equal {
+                    self.set_chosen_entries_from(
+                        &self.read_responses[0].clone(),
+                        read_response_message.chosen_sequence_end + 1,
+                    )
+                }
+
+                self.finish_read.take().unwrap().send(all_equal).unwrap()
+            }
+        }
+    }
+
+    fn all_responses_equal(&self) -> bool {
+        let first = &self.read_responses[0];
+
+        self.read_responses.iter().all(|entry| entry == first)
+    }
+
+    fn set_chosen_entries_from(&mut self, chosen_entries: &Vec<LogEntry>, from: usize) {
+        let mut current = from;
+        for entry in chosen_entries {
+            self.set_log(
+                current,
+                entry.proposal_number.clone(),
+                entry.command.clone(),
+            );
+            current += 1;
+        }
+    }
+
     fn get_chosen_entry(&self, index: usize) -> Option<LogEntry> {
         self.log
             .get(index)
@@ -335,6 +415,33 @@ impl MultipaxosState {
             })
             .map(|(index, _)| index)
             .unwrap_or(self.log.len())
+    }
+
+    fn chosen_sequence_end(&self) -> usize {
+        for i in 0..self.log.len() - 1 {
+            match &self.log[i] {
+                None => return i,
+                Some(entry) => {
+                    if entry.proposal_number != INFINITE_PROPOSAL {
+                        return i;
+                    }
+                }
+            }
+        }
+
+        self.log.len() - 1
+    }
+
+    fn get_chosen_sequence_from(&self, index: usize) -> Vec<LogEntry> {
+        let until = self.chosen_sequence_end();
+
+        self.log
+            .get(index..until + 1)
+            .unwrap_or_default()
+            .iter()
+            .cloned()
+            .map(|entry| entry.unwrap())
+            .collect::<Vec<_>>()
     }
 }
 
@@ -435,7 +542,6 @@ impl Multipaxos {
             state.go_to_accept_phase(index, command_to_propose.clone())
         };
 
-        // TODO: Implement accept phase
         let (propose_message, accept_finished) = {
             let mut state = self.state.lock().await;
             state.go_to_accept_phase(index, command_to_propose.clone())
@@ -471,7 +577,10 @@ impl Multipaxos {
         // If n' was smaller than current proposal, it would not have been able to be prepared, or
         // if it was prepared it would not have been accepted (because current prepared interrupted it)
         // or if the value was accepted, it must have then been proposed in the current proposal.
-        let success_message = SuccessMessage { index, command: command.clone() };
+        let success_message = SuccessMessage {
+            index,
+            command: command.clone(),
+        };
         self.network
             .broadcast(Message::Success(success_message))
             .await?;
@@ -481,6 +590,43 @@ impl Multipaxos {
         }
 
         Ok(())
+    }
+
+    // TODO: Probably want to read latest information instead
+    // TODO: Update the state when this is called and everytime a subsequent entry gets chosen
+    pub async fn read_log(&self, start: usize) -> Vec<LogEntry> {
+        let chosen_sequence_end = {
+            let mut state = self.state.lock().await;
+            state.chosen_sequence_end()
+        };
+
+        loop {
+            let (read_message, finish_read_recv) = {
+                let mut state = self.state.lock().await;
+                state.go_to_read_phase(chosen_sequence_end)
+            };
+            self.network
+                .broadcast(Message::Read(read_message))
+                .await
+                .unwrap();
+
+            let majority_equal = finish_read_recv.await.unwrap();
+            if majority_equal {
+                break;
+            }
+        }
+
+        {
+            let mut state = self.state.lock().await;
+            state
+                .log
+                .get(start..state.chosen_sequence_end() + 1)
+                .unwrap_or_default()
+                .iter()
+                .cloned()
+                .map(|entry| entry.unwrap())
+                .collect()
+        }
     }
 
     pub async fn get_log(&self) -> Vec<Option<LogEntry>> {
@@ -503,13 +649,15 @@ impl Multipaxos {
                     let packet = result.unwrap();
                     match packet.data {
                         Message::Heartbeat => {self.process_heartbeat(packet.from).await}
-                        Message::Prepare(prepare) => {self.process_prepare(prepare, packet.from).await}
-                        Message::RejectPrepare(reject_prepare) => {self.process_reject_prepare(reject_prepare, packet.from).await}
-                        Message::Promise(promise) => {self.process_promise(promise, packet.from).await}
-                        Message::Propose(propose) => {self.process_propose(propose, packet.from).await}
-                        Message::Accept(accept) => {self.process_accept(accept, packet.from).await}
-                        Message::Success(success) => {self.process_success(success, packet.from).await}
-                        Message::SuccessResponse(success_response) => {self.process_success_response(success_response, packet.from).await}
+                        Message::Prepare(prepare) => self.process_prepare(prepare, packet.from).await,
+                        Message::RejectPrepare(reject_prepare) => self.process_reject_prepare(reject_prepare, packet.from).await,
+                        Message::Promise(promise) => self.process_promise(promise, packet.from).await,
+                        Message::Propose(propose) => self.process_propose(propose, packet.from).await,
+                        Message::Accept(accept) => self.process_accept(accept, packet.from).await,
+                        Message::Success(success) => self.process_success(success, packet.from).await,
+                        Message::SuccessResponse(success_response) => self.process_success_response(success_response, packet.from).await,
+                        Message::Read(read) => self.process_read(read, packet.from).await,
+                        Message::ReadResponse(read_response) => self.process_read_response(read_response, packet.from).await,
                     };
                 }
                 _ = self.cancellation_token.cancelled() => {
@@ -736,6 +884,40 @@ impl Multipaxos {
             );
         }
     }
+
+    async fn process_read(&self, read_message: ReadMessage, from: NodeId) {
+        debug!(
+            "Node {} received read {:?} from {}",
+            self.network.node, read_message, from
+        );
+        let mut state = self.state.lock().await;
+
+        let read_response = ReadResponseMessage {
+            id: read_message.id,
+            chosen_sequence_end: read_message.chosen_sequence_end,
+            missing_committed_entries: state
+                .get_chosen_sequence_from(read_message.chosen_sequence_end + 1),
+        };
+
+        self.network
+            .send(from, Message::ReadResponse(read_response.clone()))
+            .await
+            .unwrap();
+        debug!(
+            "Node {} sent read response {:?} to {}",
+            self.network.node, read_response, from
+        );
+    }
+
+    async fn process_read_response(&self, read_response: ReadResponseMessage, from: NodeId) {
+        debug!(
+            "Node {} recevied read response {:?} from {}",
+            self.network.node, read_response, from
+        );
+        let mut state = self.state.lock().await;
+
+        state.process_read_response(read_response);
+    }
 }
 
 #[cfg(test)]
@@ -743,9 +925,7 @@ mod test {
     use crate::core::create_channel_network;
     use crate::multipaxos::{Command, CommandKind, Multipaxos, WriteCommand};
     use futures::future::JoinAll;
-    use log::{debug, info, log_enabled, Level};
     use std::collections::HashMap;
-    use std::env::set_var;
     use std::time::Duration;
 
     #[tokio::test]
@@ -774,37 +954,28 @@ mod test {
             })
             .await;
 
-        info!("*********** Result {:?}", result);
-
         let result = multipaxoses[&2]
             .issue_command(Command {
                 id: 2,
                 client_id: 69,
-                command_kind: CommandKind::Write(WriteCommand { key: 1, value: 10 }),
+                command_kind: CommandKind::Write(WriteCommand { key: 2, value: 12 }),
             })
             .await;
 
-        info!("*********** Result {:?}", result);
-
         assert!(result.is_ok());
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut logs = vec![];
 
         for node in &nodes {
-            println!(
-                "Node {} log: {:?}",
-                node,
-                multipaxoses[node].get_log().await
-            );
-            multipaxoses[node].quit();
+            logs.push(multipaxoses[node].read_log(0).await);
         }
 
+        for node in &nodes {
+            multipaxoses[node].quit();
+        }
         spawned_tasks.into_iter().collect::<JoinAll<_>>().await;
 
-        assert!(false);
-
-        // TODO: Implement proper test
+        let first = &logs[0];
+        assert!(logs.iter().all(|log| log == first))
     }
-
-    // TODO: Implement more tests?
 }
