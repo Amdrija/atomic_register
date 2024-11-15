@@ -30,9 +30,16 @@ struct WriteCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive, PartialEq, Eq)]
-enum Command {
+enum CommandKind {
     NoOp,
     Write(WriteCommand),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Archive, PartialEq, Eq)]
+struct Command {
+    id: u64,
+    client_id: u64,
+    command_kind: CommandKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive)]
@@ -130,7 +137,11 @@ impl MultipaxosState {
             heard_from: vec![],
             log: vec![Some(LogEntry {
                 proposal_number: INFINITE_PROPOSAL.clone(),
-                command: Command::NoOp,
+                command: Command {
+                    id: 0,
+                    client_id: 0,
+                    command_kind: CommandKind::NoOp,
+                },
             })],
             min_promised_proposal: zero_proposal.clone(),
             max_round: zero_proposal.round,
@@ -442,9 +453,6 @@ impl Multipaxos {
             state.set_log(index, INFINITE_PROPOSAL.clone(), command_to_propose.clone());
         }
 
-        // TODO: Add uuid's for commands so you can compare them?
-        // TODO: Figure out if we want to actually compare commands by semantics
-        // Or by ID - probably ID
         if command_to_propose != command {
             return bail!("The proposal slot {} is taken, try again", index);
         }
@@ -473,8 +481,8 @@ impl Multipaxos {
                     match packet.data {
                         Message::Heartbeat => {self.process_heartbeat(packet.from).await}
                         Message::Prepare(prepare) => {self.process_prepare(prepare, packet.from).await}
-                        Message::RejectPrepare(reject_prepare) => {self.process_reject_prepare(reject_prepare).await}
-                        Message::Promise(promise) => {self.process_promise(promise).await}
+                        Message::RejectPrepare(reject_prepare) => {self.process_reject_prepare(reject_prepare, packet.from).await}
+                        Message::Promise(promise) => {self.process_promise(promise, packet.from).await}
                         Message::Propose(propose) => {self.process_propose(propose, packet.from).await}
                         Message::Accept(accept) => {self.process_accept(accept, packet.from).await}
                         Message::Success(success) => {self.process_success(success, packet.from).await}
@@ -542,7 +550,7 @@ impl Multipaxos {
             };
 
             self.network
-                .send(from, Message::Promise(promise_message))
+                .send(from, Message::Promise(promise_message.clone()))
                 .await
                 .unwrap();
             debug!(
@@ -572,7 +580,7 @@ impl Multipaxos {
     ) {
         debug!(
             "Node {} received reject prepare {:?} from {}",
-            self.network.node, reject_prepare_message
+            self.network.node, reject_prepare_message, from
         );
         let mut state = self.state.lock().await;
         if state.current_proposal < reject_prepare_message.proposal_number {
@@ -628,7 +636,7 @@ impl Multipaxos {
                 };
 
                 self.network
-                    .send(from, Message::Success(success_message))
+                    .send(from, Message::Success(success_message.clone()))
                     .await
                     .unwrap();
                 debug!(
@@ -710,7 +718,7 @@ impl Multipaxos {
 #[cfg(test)]
 mod test {
     use crate::core::create_channel_network;
-    use crate::multipaxos::{Command, Multipaxos, WriteCommand};
+    use crate::multipaxos::{Command, CommandKind, Multipaxos, WriteCommand};
     use futures::future::JoinAll;
     use log::{debug, info, log_enabled, Level};
     use std::collections::HashMap;
@@ -740,13 +748,21 @@ mod test {
         tokio::time::sleep(Duration::from_millis(2100)).await;
 
         let result = multipaxoses[&2]
-            .issue_command(Command::Write(WriteCommand { key: 1, value: 10 }))
+            .issue_command(Command {
+                id: 1,
+                client_id: 69,
+                command_kind: CommandKind::Write(WriteCommand { key: 1, value: 10 }),
+            })
             .await;
 
         info!("*********** Result {:?}", result);
 
         let result = multipaxoses[&2]
-            .issue_command(Command::Write(WriteCommand { key: 2, value: 12 }))
+            .issue_command(Command {
+                id: 2,
+                client_id: 69,
+                command_kind: CommandKind::Write(WriteCommand { key: 1, value: 10 }),
+            })
             .await;
 
         info!("*********** Result {:?}", result);
