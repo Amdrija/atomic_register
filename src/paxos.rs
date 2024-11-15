@@ -38,7 +38,7 @@ struct RejectMessage {
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
-pub enum Message {
+enum Message {
     Prepare(PrepareMessage),
     Promise(PromiseMessage),
     Propose(ProposeMessage),
@@ -219,15 +219,17 @@ impl Paxos {
     }
 
     async fn process_accept_message(&self, message: AcceptMessage) {
-        let previous_acks = self.accept_acks.fetch_add(1, Ordering::SeqCst);
-        if previous_acks == self.virtual_network.len() as u64 / 2 {
-            self.decided
-                .lock()
-                .await
-                .take()
-                .unwrap()
-                .send(self.proposed_value.load(Ordering::SeqCst))
-                .unwrap();
+        if message.round == self.round.load(Ordering::SeqCst) {
+            let previous_acks = self.accept_acks.fetch_add(1, Ordering::SeqCst);
+            if previous_acks == self.virtual_network.len() as u64 / 2 {
+                self.decided
+                    .lock()
+                    .await
+                    .take()
+                    .unwrap()
+                    .send(self.proposed_value.load(Ordering::SeqCst))
+                    .unwrap();
+            }
         }
     }
 
@@ -244,8 +246,8 @@ impl Paxos {
 mod test {
     use crate::core::{create_channel_network, NodeId, Packet, VirtualNetwork};
     use crate::paxos::{Message, Paxos};
-    use futures::future::{JoinAll, TryJoinAll};
-    use std::collections::{HashMap, HashSet};
+    use futures::future::{JoinAll};
+    use std::collections::{HashMap};
     use std::sync::Arc;
     use tokio::sync::mpsc;
     use tokio::sync::mpsc::{Receiver, Sender};
