@@ -453,6 +453,29 @@ impl Multipaxos {
             state.set_log(index, INFINITE_PROPOSAL.clone(), command_to_propose.clone());
         }
 
+        // Help everyone out so they know this command was decided at this index
+        // It will not be possible to decide anything else at this index, since
+        // a majority must have accepted the command and this index in order to
+        // get here, so, there's a couple of possibilities:
+        // 1. Somebody tries to prepare at this index, well, because a majority
+        // accepted this value, at least 1 will return this accepted value to the
+        // preparer, so the preparer will be force to propose this value
+        // 2. Somebody does a prepare with a higher number, but nobody has accepted
+        // anything at this index -> then, because of the prepare, it would not be possible
+        // to get majority accepts
+        // 3. Somebody does a prepare with a higher number, but another value was accepted,
+        // so the new preparer has to propose a different value. Not possible, since that would
+        // mean that 1 node has accepted a value with proposal number n', meaning that n' was prepared
+        // by a majority. If n' is greater than the current proposal number, at least 1 node in the
+        // majority would have to have rejected the proposal, since it promised a higher number.
+        // If n' was smaller than current proposal, it would not have been able to be prepared, or
+        // if it was prepared it would not have been accepted (because current prepared interrupted it)
+        // or if the value was accepted, it must have then been proposed in the current proposal.
+        let success_message = SuccessMessage { index, command: command.clone() };
+        self.network
+            .broadcast(Message::Success(success_message))
+            .await?;
+
         if command_to_propose != command {
             return bail!("The proposal slot {} is taken, try again", index);
         }
@@ -727,10 +750,6 @@ mod test {
 
     #[tokio::test]
     async fn test_multipaxos() {
-        unsafe {
-            set_var("RUST_LOG", "DEBUG");
-        }
-        pretty_env_logger::init_timed();
         let nodes = vec![0, 1, 2];
         let (mut virtual_networks, mut receivers) = create_channel_network(nodes.clone());
 
@@ -740,12 +759,12 @@ mod test {
             let network = virtual_networks.remove(node).unwrap();
             let receive_channel = receivers.remove(node).unwrap();
             let (multipaxos, background_tasks) =
-                Multipaxos::new(network, Duration::from_millis(1000), receive_channel);
+                Multipaxos::new(network, Duration::from_millis(10), receive_channel);
             multipaxoses.insert(node, multipaxos);
             spawned_tasks.push(background_tasks);
         }
 
-        tokio::time::sleep(Duration::from_millis(2100)).await;
+        tokio::time::sleep(Duration::from_millis(21)).await;
 
         let result = multipaxoses[&2]
             .issue_command(Command {
@@ -768,6 +787,8 @@ mod test {
         info!("*********** Result {:?}", result);
 
         assert!(result.is_ok());
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         for node in &nodes {
             println!(
