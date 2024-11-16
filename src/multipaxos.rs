@@ -581,6 +581,17 @@ impl Multipaxos {
         Ok(())
     }
 
+
+    // TODO: This function might get stuck in theory or return wrong information
+    // if the leader node crashes without informing a majority of nodes
+    // that the entry has been chosen and none of the leaders afterwards try to propose.
+    // This is possible because the current node could reads this chosen entry, but it will
+    // then never be able to read a majority that agrees on the chosen entry (some have the new
+    // one, while some have the old one). Or, it may read only the majority with the old chosen
+    // entry, causing it to return the wrong end of the sequence. Anyways, we decided that
+    // we don't handle this edge case. In reality, a way to fix this would be to return
+    // a majority accepts, but I have to think about it a bit more (or that a leader proposes
+    // a NoOp when it first becomes a leader).
     pub async fn read_log(&self, start: usize) -> Vec<LogEntry> {
         let chosen_sequence_end = {
             let state = self.state.lock().await;
