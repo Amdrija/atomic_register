@@ -10,8 +10,8 @@ Unlike most commercial key-value stores, an important distinction of this projec
 
 ## Algorithms
 
-- [ ] [ABD](https://dl.acm.org/doi/pdf/10.1145/200836.200869)
-- [ ] [Paxos](https://lamport.azurewebsites.net/pubs/paxos-simple.pdf)
+- [x] [ABD](https://dl.acm.org/doi/pdf/10.1145/200836.200869)
+- [x] [Paxos](https://lamport.azurewebsites.net/pubs/paxos-simple.pdf)
 - [ ] [Fast Paxos](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/tr-2005-112.pdf)
 - [ ] [Raft](https://raft.github.io/)
 
@@ -53,9 +53,34 @@ To reset the rules:
 1. Run `sudo pfctl -a ts -F all` - flushes all rules in anchor `ts`
 2. `sudo dnctl -q flush` - flushes rules for dummynet pipes (`-q` for quiet).
 
+### Delay configuration
+
+The `run.py` script will try to parse `delays.toml` file to read the propagation
+time for different links between the nodes. An exmaple of a delay config:
+
+```toml
+1 = { 2 = 80, 3 = 150, 4 = 250, 5 = 100 }
+2 = { 1 = 80, 3 = 70, 4 = 170, 5 = 180 }
+3 = { 1 = 150, 2 = 70, 4 = 100, 5 = 250 }
+4 = { 1 = 250, 2 = 170, 3 = 100, 5 = 150 }
+5 = { 1 = 100, 2 = 180, 3 = 250, 4 = 150 }
+```
+
+This means that the link from node `1` to node `2` needs `80ms` to propagate the message.
+If a node is omitted, it's propagation delay is treated as `0ms`. Additionally, asymmetric
+links are supported, for example:
+
+```toml
+1 = { 2 = 80 }
+2 = { 1 = 90 }
+```
+
+A message from node `1` to node `2` will take `80ms` to arrive, while a message from
+node `2` to node `1` will take `90ms` to arrive.
+
+
 ### Network Problems
 
 In times of concurrent operations, the algorithm is taking 4RTs to complete.
 This occurs because the Nagel's algorithm was enabled. 
-Because the packets are very small, Nagel's algorithm would wait until ACK arrives before sending the next messagee.
-As a result, if 2 nodes start an operation around the same time
+Because the packets are very small, Nagel's algorithm would wait until ACK arrives before sending the next message.

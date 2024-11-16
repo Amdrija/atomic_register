@@ -1,5 +1,5 @@
 use anyhow::{Ok, Result};
-use log::info;
+use log::{error, info};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -45,7 +45,16 @@ where
             to: destination,
             data,
         };
-        self.senders[&destination].send(packet).await?;
+        let result = self.senders[&destination].send(packet).await;
+        if let Err(error) = result {
+            // Unfortunately, this error has to be swallowed, as calling unwrap will panic
+            // the calling thread, which can possibly be the main thread or the thread responsible
+            // for receiving messages, therefore, effectively killing the node (as it will not
+            // be able to respond to any messages). This idea with channels wasn't so good :(
+            // Best way to crash the nodes is to set up the link to drop packets instead of
+            // actually crashing it.
+            error!("Removing {} from network because the recv part of the channel is closed, likely due to closed connection, error: {}", destination, error);
+        }
 
         Ok(())
     }

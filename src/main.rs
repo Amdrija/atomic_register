@@ -1,8 +1,8 @@
 use crate::abd::ABD;
 use crate::config::Config;
+use crate::multipaxos::{Command, CommandKind, Multipaxos, WriteCommand};
 use crate::network::initialize_connections;
 use anyhow::Result;
-use futures::future::TryJoinAll;
 use log::{error, info};
 use std::process::exit;
 use std::sync::Arc;
@@ -16,10 +16,81 @@ mod multipaxos;
 mod network;
 mod paxos;
 
-async fn run() -> Result<()> {
-    // TODO: Implement Multipaxos
-    // TODO: Maybe figure out if we want it to be a separate binary -> one per algorithm?
-    // TODO: Set up tokio so that if any of the tasks panic, the whole process exits? Same thing for tests
+#[allow(dead_code)]
+async fn run_paxos() -> Result<()> {
+    info!("Started");
+    let mut config = Config::new()?;
+    info!("Finished parsing config: {:#?}", config);
+
+    let (virtual_network, receiver_channel, read_tasks, send_loop_tasks) =
+        initialize_connections(&config).await?;
+    info!("Initialized connections to all nodes");
+
+    let (multipaxos, looping_tasks) =
+        Multipaxos::new(virtual_network, Duration::from_secs(1), receiver_channel);
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let leader = *config.nodes.keys().max().unwrap();
+    if config.my_node_id == leader {
+        let result = multipaxos
+            .issue_command(Command {
+                id: 22,
+                client_id: config.my_node_id as u64,
+                command_kind: CommandKind::Write(WriteCommand { key: 23, value: 29 }),
+            })
+            .await;
+
+        if let Err(e) = result {
+            info!("Error {e}");
+        }
+    } else {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+
+    let log = multipaxos.read_log(0).await;
+    println!("Log {:#?}", log);
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    if config.my_node_id != leader {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        config.nodes.remove(&leader);
+        let leader = *config.nodes.keys().max().unwrap();
+        if config.my_node_id == leader {
+            while let Err(error) = multipaxos
+                .issue_command(Command {
+                    id: 34,
+                    client_id: config.my_node_id as u64,
+                    command_kind: CommandKind::Write(WriteCommand { key: 35, value: 37 }),
+                })
+                .await
+            {
+                info!("Error {error}");
+            }
+        } else {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+
+        let log = multipaxos.read_log(0).await;
+        println!("Log {:#?}", log);
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+
+    info!("Initiated exit");
+    multipaxos.quit();
+
+    info!("Cleaning up and exiting");
+    looping_tasks.await?;
+    drop(multipaxos);
+
+    read_tasks.await?.into_iter().collect::<Result<()>>()?;
+    send_loop_tasks.await?.into_iter().collect::<Result<()>>()?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+async fn run_abd() -> Result<()> {
     info!("Started");
     let config = Config::new()?;
     info!("Finished parsing config: {:#?}", config);
@@ -27,15 +98,6 @@ async fn run() -> Result<()> {
     let (virtual_network, receiver_channel, read_tasks, send_loop_tasks) =
         initialize_connections(&config).await?;
     info!("Initialized connections to all nodes");
-
-    let reader_handles = read_tasks
-        .into_iter()
-        .map(|read_task| tokio::spawn(read_task))
-        .collect::<Vec<_>>();
-    let sender_handles = send_loop_tasks
-        .into_iter()
-        .map(|send_task| tokio::spawn(send_task))
-        .collect::<Vec<_>>();
 
     let abd = Arc::new(ABD::new(virtual_network));
     let (quit, quit_signal) = mpsc::channel(1);
@@ -50,7 +112,7 @@ async fn run() -> Result<()> {
         "Node {}: waiting 2s for everyone to connect",
         config.my_node_id
     );
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
     println!(
         "Node {}: experiment started at: {:.3}",
         config.my_node_id,
@@ -81,7 +143,7 @@ async fn run() -> Result<()> {
         );
     }
 
-    tokio::time::sleep(Duration::from_secs(20)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
     info!("Initiated exit");
     quit.send(()).await?;
 
@@ -90,18 +152,8 @@ async fn run() -> Result<()> {
     receive_loop_handle.await?;
     drop(abd);
 
-    reader_handles
-        .into_iter()
-        .collect::<TryJoinAll<_>>()
-        .await?
-        .into_iter()
-        .collect::<Result<()>>()?;
-    sender_handles
-        .into_iter()
-        .collect::<TryJoinAll<_>>()
-        .await?
-        .into_iter()
-        .collect::<Result<()>>()?;
+    read_tasks.await?.into_iter().collect::<Result<()>>()?;
+    send_loop_tasks.await?.into_iter().collect::<Result<()>>()?;
 
     Ok(())
 }
@@ -109,7 +161,7 @@ async fn run() -> Result<()> {
 #[tokio::main]
 async fn main() {
     pretty_env_logger::init_timed();
-    if let Err(error) = run().await {
+    if let Err(error) = run_paxos().await {
         error!("Error encountered while sending: {error}");
         exit(1);
     }

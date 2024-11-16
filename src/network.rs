@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::core::{NodeId, Packet, VirtualNetwork};
 use anyhow::{Context, Result};
+use futures::future::TryJoinAll;
 use log::{debug, info};
 use rkyv::api::high::{HighSerializer, HighValidator};
 use rkyv::bytecheck::CheckBytes;
@@ -14,6 +15,7 @@ use std::future::Future;
 use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpSocket, TcpStream},
@@ -28,8 +30,8 @@ pub async fn initialize_connections<T>(
 ) -> Result<(
     VirtualNetwork<T>,
     Receiver<Packet<T>>,
-    Vec<impl Future<Output = Result<()>>>,
-    Vec<impl Future<Output = Result<()>>>,
+    TryJoinAll<JoinHandle<Result<()>>>,
+    TryJoinAll<JoinHandle<Result<()>>>,
 )>
 where
     T: Debug
@@ -64,7 +66,18 @@ where
     }
 
     let receiver_tasks = receiver_handle.await??;
-    Ok((virtual_network, recv_recv, receiver_tasks, send_loop_tasks))
+
+    let receiver_handles = receiver_tasks
+        .into_iter()
+        .map(|read_task| tokio::spawn(read_task))
+        .collect::<TryJoinAll<_>>();
+
+    let sender_handles = send_loop_tasks
+        .into_iter()
+        .map(|send_task| tokio::spawn(send_task))
+        .collect::<TryJoinAll<_>>();
+
+    Ok((virtual_network, recv_recv, receiver_handles, sender_handles))
 }
 
 pub async fn initialize_send<T>(

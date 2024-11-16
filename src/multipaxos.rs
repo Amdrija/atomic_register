@@ -1,67 +1,60 @@
 use crate::core::{NodeId, Packet, VirtualNetwork};
-use anyhow::{anyhow, bail, Context, Result};
-use futures::future::{ok, JoinAll};
-use log::{debug, error, info};
+use anyhow::{bail, Context, Result};
+use log::{debug, info};
 use rkyv::{Archive, Deserialize, Serialize};
-use std::cmp::min;
 use std::future::Future;
-use std::ops::Deref;
-use std::os::macos::raw::stat;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
-use std::thread::sleep;
-use std::time::{Duration, Instant};
-use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{mpsc, oneshot, Mutex};
-use tokio::task::JoinHandle;
-use tokio::{select, time};
+use std::time::Duration;
+use tokio::select;
+use tokio::sync::mpsc::Receiver;
+use tokio::sync::{oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive, PartialEq, Eq, PartialOrd, Ord)]
-struct ProposalNumber {
+pub struct ProposalNumber {
     round: u64,
     node: NodeId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive, PartialEq, Eq)]
-struct WriteCommand {
-    key: u64,
-    value: u32,
+pub struct WriteCommand {
+    pub key: u64,
+    pub value: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive, PartialEq, Eq)]
-enum CommandKind {
+pub enum CommandKind {
     NoOp,
     Write(WriteCommand),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive, PartialEq, Eq)]
-struct Command {
-    id: u64,
-    client_id: u64,
-    command_kind: CommandKind,
+pub struct Command {
+    pub id: u64,
+    pub client_id: u64,
+    pub command_kind: CommandKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive)]
-struct PrepareMessage {
+pub struct PrepareMessage {
     proposal_number: ProposalNumber,
     index: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive)]
-struct PromiseMessage {
+pub struct PromiseMessage {
     proposal_number: ProposalNumber,
     accepted: Option<LogEntry>,
     no_more_accepted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive)]
-struct RejectPrepareMessage {
+pub struct RejectPrepareMessage {
     proposal_number: ProposalNumber,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive)]
-struct ProposeMessage {
+pub struct ProposeMessage {
     proposal_number: ProposalNumber,
     index: usize,
     command: Command,
@@ -69,38 +62,37 @@ struct ProposeMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive)]
-struct AcceptMessage {
+pub struct AcceptMessage {
     proposal_number: ProposalNumber,
     first_unchosen_index: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive)]
-struct SuccessMessage {
+pub struct SuccessMessage {
     index: usize,
     command: Command,
 }
 
-// TODO: Check if we actually need to identify this message
 #[derive(Debug, Clone, Serialize, Deserialize, Archive)]
-struct SuccessResponseMessage {
+pub struct SuccessResponseMessage {
     first_unchosen_index: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive)]
-struct ReadMessage {
+pub struct ReadMessage {
     id: u64,
     chosen_sequence_end: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive)]
-struct ReadResponseMessage {
+pub struct ReadResponseMessage {
     id: u64,
     chosen_sequence_end: usize,
     missing_committed_entries: Vec<LogEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive)]
-enum Message {
+pub enum Message {
     Heartbeat,
     Prepare(PrepareMessage),
     Promise(PromiseMessage),
@@ -114,7 +106,7 @@ enum Message {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive, PartialEq, Eq)]
-struct LogEntry {
+pub struct LogEntry {
     proposal_number: ProposalNumber,
     command: Command,
 }
@@ -410,7 +402,7 @@ impl MultipaxosState {
         self.log
             .iter()
             .enumerate()
-            .find(|(index, entry)| {
+            .find(|(_index, entry)| {
                 entry.is_some() && entry.as_ref().unwrap().proposal_number < INFINITE_PROPOSAL
             })
             .map(|(index, _)| index)
@@ -445,7 +437,7 @@ impl MultipaxosState {
     }
 }
 
-struct Multipaxos {
+pub struct Multipaxos {
     network: VirtualNetwork<Message>,
     heartbeat_delay: Duration,
     state: Arc<Mutex<MultipaxosState>>,
@@ -457,7 +449,7 @@ impl Multipaxos {
         virtual_network: VirtualNetwork<Message>,
         heartbeat_delay: Duration,
         receive_channel: Receiver<Packet<Message>>,
-    ) -> (Arc<Self>, impl Future) {
+    ) -> (Arc<Self>, impl Future<Output = Result<()>>) {
         let node = virtual_network.node;
         let nodes = virtual_network.len();
 
@@ -484,9 +476,11 @@ impl Multipaxos {
         });
 
         let cleanup_task = async move {
-            heartbeat_handle.await.unwrap();
-            heartbeat_procssing_handle.await.unwrap();
-            receive_handle.await.unwrap();
+            heartbeat_handle.await?;
+            heartbeat_procssing_handle.await?;
+            receive_handle.await?;
+
+            Ok(())
         };
 
         (multipaxos, cleanup_task)
@@ -497,10 +491,10 @@ impl Multipaxos {
     // and then they will potentially live-lock each other
     pub async fn issue_command(&self, command: Command) -> Result<()> {
         let prepared = {
-            let mut state = self.state.lock().await;
+            let state = self.state.lock().await;
 
             if !state.am_i_leader() {
-                return bail!("Current node not leader, leader={}", state.leader);
+                bail!("Current node not leader, leader={}", state.leader);
             }
 
             state.prepared
@@ -535,11 +529,6 @@ impl Multipaxos {
             let mut state = self.state.lock().await;
             info!("Node {} skipping prepare state", self.network.node);
             (state.skip_prepare_state(), command.clone())
-        };
-
-        let (propose_message, accept_finished) = {
-            let mut state = self.state.lock().await;
-            state.go_to_accept_phase(index, command_to_propose.clone())
         };
 
         let (propose_message, accept_finished) = {
@@ -586,17 +575,15 @@ impl Multipaxos {
             .await?;
 
         if command_to_propose != command {
-            return bail!("The proposal slot {} is taken, try again", index);
+            bail!("The proposal slot {} is taken, try again", index);
         }
 
         Ok(())
     }
 
-    // TODO: Probably want to read latest information instead
-    // TODO: Update the state when this is called and everytime a subsequent entry gets chosen
     pub async fn read_log(&self, start: usize) -> Vec<LogEntry> {
         let chosen_sequence_end = {
-            let mut state = self.state.lock().await;
+            let state = self.state.lock().await;
             state.chosen_sequence_end()
         };
 
@@ -617,7 +604,7 @@ impl Multipaxos {
         }
 
         {
-            let mut state = self.state.lock().await;
+            let state = self.state.lock().await;
             state
                 .log
                 .get(start..state.chosen_sequence_end() + 1)
@@ -859,7 +846,7 @@ impl Multipaxos {
             "Node {} got success response {:?} from {}",
             self.network.node, success_response_message, from
         );
-        let mut state = self.state.lock().await;
+        let state = self.state.lock().await;
         if success_response_message.first_unchosen_index < state.first_unchosen_index() {
             let success_message = SuccessMessage {
                 index: success_response_message.first_unchosen_index,
@@ -924,7 +911,7 @@ impl Multipaxos {
 mod test {
     use crate::core::create_channel_network;
     use crate::multipaxos::{Command, CommandKind, Multipaxos, WriteCommand};
-    use futures::future::JoinAll;
+    use futures::future::TryJoinAll;
     use std::collections::HashMap;
     use std::time::Duration;
 
@@ -973,7 +960,12 @@ mod test {
         for node in &nodes {
             multipaxoses[node].quit();
         }
-        spawned_tasks.into_iter().collect::<JoinAll<_>>().await;
+
+        assert!(spawned_tasks
+            .into_iter()
+            .collect::<TryJoinAll<_>>()
+            .await
+            .is_ok());
 
         let first = &logs[0];
         assert!(logs.iter().all(|log| log == first))

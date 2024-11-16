@@ -2,11 +2,10 @@ use crate::core::{NodeId, Packet, VirtualNetwork};
 use anyhow::Result;
 use log::info;
 use rkyv::{Archive, Deserialize, Serialize};
-use std::ops::Deref;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::select;
-use tokio::sync::oneshot::{Receiver, Sender};
+use tokio::sync::oneshot::Sender;
 use tokio::sync::{oneshot, Mutex};
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
@@ -246,8 +245,8 @@ impl Paxos {
 mod test {
     use crate::core::{create_channel_network, NodeId, Packet, VirtualNetwork};
     use crate::paxos::{Message, Paxos};
-    use futures::future::{JoinAll};
-    use std::collections::{HashMap};
+    use futures::future::JoinAll;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::mpsc;
     use tokio::sync::mpsc::{Receiver, Sender};

@@ -61,6 +61,7 @@ with open(delays_path, "rb") as delays_file:
     delays = tomllib.load(delays_file)
     print(f"Loaded delays {delays}")
 
+reset_network_config()
 try:
     configure_network_delays(config, delays)
 except Exception as e:
@@ -79,9 +80,10 @@ print()
 for process in processes:
     output, errors = process.communicate()
     rc = process.wait()
+    print(errors)
+    print()
     print(output)
-    if rc != 0 :
-        print()
-        print(errors)
+    print("************")
+    print()
 
 reset_network_config()
