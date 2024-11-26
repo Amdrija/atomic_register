@@ -581,7 +581,6 @@ impl Multipaxos {
         Ok(())
     }
 
-
     // TODO: This function might get stuck in theory or return wrong information
     // if the leader node crashes without informing a majority of nodes
     // that the entry has been chosen and none of the leaders afterwards try to propose.
@@ -627,6 +626,7 @@ impl Multipaxos {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn get_log(&self) -> Vec<Option<LogEntry>> {
         self.state.lock().await.log.clone()
     }
@@ -888,7 +888,7 @@ impl Multipaxos {
             "Node {} received read {:?} from {}",
             self.network.node, read_message, from
         );
-        let mut state = self.state.lock().await;
+        let state = self.state.lock().await;
 
         let read_response = ReadResponseMessage {
             id: read_message.id,
@@ -951,6 +951,7 @@ mod test {
                 command_kind: CommandKind::Write(WriteCommand { key: 1, value: 10 }),
             })
             .await;
+        assert!(result.is_ok());
 
         let result = multipaxoses[&2]
             .issue_command(Command {

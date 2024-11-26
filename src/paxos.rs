@@ -286,7 +286,7 @@ mod test {
         let nodes = vec![1, 2, 3, 4, 5];
         let (virtual_networks, recv_channels) = create_channel_network(nodes.clone());
 
-        let (mut paxoses, receive_handles, quit_signals) =
+        let (paxoses, receive_handles, quit_signals) =
             initialize_paxoses(nodes.clone(), virtual_networks, recv_channels);
 
         for node in &nodes {
@@ -309,21 +309,22 @@ mod test {
         let nodes = vec![1, 2, 3, 4, 5];
         let (virtual_networks, recv_channels) = create_channel_network(nodes.clone());
 
-        let (mut paxoses, receive_handles, quit_signals) =
+        let (paxoses, receive_handles, quit_signals) =
             initialize_paxoses(nodes.clone(), virtual_networks, recv_channels);
 
-        let propse_handles: Vec<JoinHandle<()>> = Vec::new();
+        let mut propose_handles: Vec<JoinHandle<()>> = Vec::new();
         let (decide_send, mut decide_recv) = mpsc::channel(10);
         for node in nodes.clone() {
             let paxos_clone = paxoses[&node].clone();
             let decide_send_clone = decide_send.clone();
-            let propose_handles = tokio::spawn(async move {
+            let propose_handle = tokio::spawn(async move {
                 let result = paxos_clone.propose(node as u32).await;
                 assert!(result.is_ok());
                 let decided = result.unwrap();
                 println!("Node {node} decided: {decided}");
                 decide_send_clone.send(decided).await.unwrap();
             });
+            propose_handles.push(propose_handle);
         }
         drop(decide_send);
         //all must agree on the same value
@@ -334,7 +335,7 @@ mod test {
         }
         assert!(decided.is_some());
         assert!(nodes.contains(&(decided.unwrap() as NodeId)));
-        propse_handles.into_iter().collect::<JoinAll<_>>().await;
+        propose_handles.into_iter().collect::<JoinAll<_>>().await;
         for quit_signal in quit_signals {
             quit_signal.send(()).await.unwrap();
         }

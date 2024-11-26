@@ -23,7 +23,7 @@ impl Flow {
         let (proposer_idx, _) = nodes
             .iter()
             .enumerate()
-            .find(|(idx, node)| **node == proposer)
+            .find(|(_, node)| **node == proposer)
             .unwrap();
 
         for i in 0..branch_len {
