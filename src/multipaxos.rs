@@ -1,3 +1,4 @@
+use crate::command::{Command, CommandKind};
 use crate::core::{NodeId, Packet, VirtualNetwork};
 use anyhow::{bail, Context, Result};
 use log::{debug, info};
@@ -14,25 +15,6 @@ use tokio_util::sync::CancellationToken;
 pub struct ProposalNumber {
     round: u64,
     node: NodeId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Archive, PartialEq, Eq)]
-pub struct WriteCommand {
-    pub key: u64,
-    pub value: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Archive, PartialEq, Eq)]
-pub enum CommandKind {
-    NoOp,
-    Write(WriteCommand),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Archive, PartialEq, Eq)]
-pub struct Command {
-    pub id: u64,
-    pub client_id: u64,
-    pub command_kind: CommandKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive)]
@@ -920,8 +902,9 @@ impl Multipaxos {
 
 #[cfg(test)]
 mod test {
+    use crate::command::{Command, CommandKind, WriteCommand};
     use crate::core::create_channel_network;
-    use crate::multipaxos::{Command, CommandKind, Multipaxos, WriteCommand};
+    use crate::multipaxos::Multipaxos;
     use futures::future::TryJoinAll;
     use std::collections::HashMap;
     use std::time::Duration;

@@ -1,6 +1,7 @@
 use crate::abd::ABD;
+use crate::command::{Command, CommandKind, WriteCommand};
 use crate::config::Config;
-use crate::multipaxos::{Command, CommandKind, Multipaxos, WriteCommand};
+use crate::multipaxos::Multipaxos;
 use crate::network::initialize_connections;
 use anyhow::Result;
 use log::{error, info};
@@ -10,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 mod abd;
+mod command;
 mod config;
 mod core;
 mod croissus;

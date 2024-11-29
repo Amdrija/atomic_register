@@ -1,9 +1,11 @@
 use crate::core::NodeId;
+use rkyv::{Archive, Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct Flow {
-    diffuse_to: HashMap<NodeId, Vec<NodeId>>,
-    echo_to: HashMap<NodeId, Vec<NodeId>>,
+    pub diffuse_to: HashMap<NodeId, HashSet<NodeId>>,
+    pub echo_to: HashMap<NodeId, HashSet<NodeId>>,
 }
 
 impl Flow {
@@ -14,7 +16,7 @@ impl Flow {
     // As a result, N = 4 * k + 1, k = 2, 3... (odd numbers are better for fault tolerance,
     // but, in theory, numbers in form of N = 4 * k are also valid, I just didn't put much
     // thought into this scenario).
-    pub fn ring(nodes: &Vec<NodeId>, proposer: NodeId) -> Flow {
+    pub fn ring(nodes: Vec<NodeId>, proposer: NodeId) -> Flow {
         // if there are 9 nodes, then we need 4 nodes more for majority along with the proposer
         // So, the length of the branch is nodes.len() / 4 = 2.
         let branch_len = nodes.len() / 4;
@@ -40,31 +42,44 @@ impl Flow {
         }
 
         let mut diffuse_to = HashMap::new();
-        diffuse_to.insert(proposer, vec![left_branch[0], right_branch[0]]);
+        diffuse_to.insert(
+            proposer,
+            vec![left_branch[0], right_branch[0]].into_iter().collect(),
+        );
 
         for i in 0..branch_len - 1 {
-            diffuse_to.insert(left_branch[i], vec![left_branch[i + 1]]);
-            diffuse_to.insert(right_branch[i], vec![right_branch[i + 1]]);
+            diffuse_to.insert(
+                left_branch[i],
+                vec![left_branch[i + 1]].into_iter().collect(),
+            );
+            diffuse_to.insert(
+                right_branch[i],
+                vec![right_branch[i + 1]].into_iter().collect(),
+            );
         }
-        diffuse_to.insert(left_branch[branch_len - 1], Vec::new());
-        diffuse_to.insert(right_branch[branch_len - 1], Vec::new());
+        diffuse_to.insert(left_branch[branch_len - 1], HashSet::new());
+        diffuse_to.insert(right_branch[branch_len - 1], HashSet::new());
 
         let mut echo_to = HashMap::new();
-        echo_to.insert(proposer, Vec::new());
+        echo_to.insert(proposer, HashSet::new());
         for (sibling1, sibling2) in left_branch[0..branch_len - 1]
             .iter()
             .zip(right_branch[0..branch_len - 1].iter().rev())
         {
-            echo_to.insert(*sibling1, vec![*sibling2]);
-            echo_to.insert(*sibling2, vec![*sibling1]);
+            echo_to.insert(*sibling1, vec![*sibling2].into_iter().collect());
+            echo_to.insert(*sibling2, vec![*sibling1].into_iter().collect());
         }
-        echo_to.insert(left_branch[branch_len - 1], Vec::new());
-        echo_to.insert(right_branch[branch_len - 1], Vec::new());
+        echo_to.insert(left_branch[branch_len - 1], HashSet::new());
+        echo_to.insert(right_branch[branch_len - 1], HashSet::new());
 
         Flow {
             diffuse_to,
             echo_to,
         }
+    }
+
+    fn vec_to_set(vector: Vec<NodeId>) -> HashSet<NodeId> {
+        vector.into_iter().collect()
     }
 
     // Enumerates the replicas that have adopted a proposal if we know it was adopted by p
@@ -113,83 +128,167 @@ mod test {
 
     #[test]
     fn test_ring_flow_9_nodes() {
-        let flow = Flow::ring(&(0..9).into_iter().collect::<Vec<_>>(), 4);
+        let flow = Flow::ring((0..9).into_iter().collect::<Vec<_>>(), 4);
 
-        assert_eq!(flow.diffuse_to[&4], vec![3, 5]);
-        assert_eq!(flow.diffuse_to[&5], vec![6]);
-        assert_eq!(flow.diffuse_to[&6], Vec::<NodeId>::new());
-        assert_eq!(flow.diffuse_to[&3], vec![2]);
-        assert_eq!(flow.diffuse_to[&2], Vec::<NodeId>::new());
+        assert_eq!(
+            flow.diffuse_to[&4],
+            vec![3, 5].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(
+            flow.diffuse_to[&5],
+            vec![6].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(flow.diffuse_to[&6], HashSet::<NodeId>::new());
+        assert_eq!(
+            flow.diffuse_to[&3],
+            vec![2].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(flow.diffuse_to[&2], HashSet::<NodeId>::new());
 
-        assert_eq!(flow.echo_to[&4], Vec::<NodeId>::new());
-        assert_eq!(flow.echo_to[&5], vec![3]);
-        assert_eq!(flow.echo_to[&6], Vec::<NodeId>::new());
-        assert_eq!(flow.echo_to[&3], vec![5]);
-        assert_eq!(flow.echo_to[&2], Vec::<NodeId>::new());
+        assert_eq!(flow.echo_to[&4], HashSet::<NodeId>::new());
+        assert_eq!(
+            flow.echo_to[&5],
+            vec![3].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(flow.echo_to[&6], HashSet::<NodeId>::new());
+        assert_eq!(
+            flow.echo_to[&3],
+            vec![5].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(flow.echo_to[&2], HashSet::<NodeId>::new());
     }
 
     #[test]
     fn test_ring_flow_13_nodes() {
-        let flow = Flow::ring(&(0..13).into_iter().collect::<Vec<_>>(), 6);
+        let flow = Flow::ring((0..13).into_iter().collect::<Vec<_>>(), 6);
 
-        assert_eq!(flow.diffuse_to[&6], vec![5, 7]);
-        assert_eq!(flow.diffuse_to[&7], vec![8]);
-        assert_eq!(flow.diffuse_to[&8], vec![9]);
-        assert_eq!(flow.diffuse_to[&9], Vec::<NodeId>::new());
-        assert_eq!(flow.diffuse_to[&5], vec![4]);
-        assert_eq!(flow.diffuse_to[&4], vec![3]);
-        assert_eq!(flow.diffuse_to[&3], Vec::<NodeId>::new());
+        assert_eq!(
+            flow.diffuse_to[&6],
+            vec![5, 7].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(
+            flow.diffuse_to[&7],
+            vec![8].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(
+            flow.diffuse_to[&8],
+            vec![9].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(flow.diffuse_to[&9], HashSet::<NodeId>::new());
+        assert_eq!(
+            flow.diffuse_to[&5],
+            vec![4].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(
+            flow.diffuse_to[&4],
+            vec![3].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(flow.diffuse_to[&3], HashSet::<NodeId>::new());
 
-        assert_eq!(flow.echo_to[&6], Vec::<NodeId>::new());
-        assert_eq!(flow.echo_to[&7], vec![4]);
-        assert_eq!(flow.echo_to[&8], vec![5]);
-        assert_eq!(flow.echo_to[&9], Vec::<NodeId>::new());
-        assert_eq!(flow.echo_to[&5], vec![8]);
-        assert_eq!(flow.echo_to[&4], vec![7]);
-        assert_eq!(flow.echo_to[&3], Vec::<NodeId>::new());
+        assert_eq!(flow.echo_to[&6], HashSet::<NodeId>::new());
+        assert_eq!(
+            flow.echo_to[&7],
+            vec![4].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(
+            flow.echo_to[&8],
+            vec![5].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(flow.echo_to[&9], HashSet::<NodeId>::new());
+        assert_eq!(
+            flow.echo_to[&5],
+            vec![8].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(
+            flow.echo_to[&4],
+            vec![7].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(flow.echo_to[&3], HashSet::<NodeId>::new());
     }
 
     #[test]
     fn test_ring_flow_13_nodes_negative_overflow() {
-        let flow = Flow::ring(&(0..13).into_iter().collect::<Vec<_>>(), 0);
+        let flow = Flow::ring((0..13).into_iter().collect::<Vec<_>>(), 0);
 
-        assert_eq!(flow.diffuse_to[&0], vec![12, 1]);
-        assert_eq!(flow.diffuse_to[&1], vec![2]);
-        assert_eq!(flow.diffuse_to[&2], vec![3]);
-        assert_eq!(flow.diffuse_to[&3], Vec::<NodeId>::new());
-        assert_eq!(flow.diffuse_to[&12], vec![11]);
-        assert_eq!(flow.diffuse_to[&11], vec![10]);
-        assert_eq!(flow.diffuse_to[&10], Vec::<NodeId>::new());
+        assert_eq!(
+            flow.diffuse_to[&0],
+            vec![12, 1].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(
+            flow.diffuse_to[&1],
+            vec![2].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(
+            flow.diffuse_to[&2],
+            vec![3].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(flow.diffuse_to[&3], HashSet::<NodeId>::new());
+        assert_eq!(
+            flow.diffuse_to[&12],
+            vec![11].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(
+            flow.diffuse_to[&11],
+            vec![10].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(flow.diffuse_to[&10], HashSet::<NodeId>::new());
 
-        assert_eq!(flow.echo_to[&0], Vec::<NodeId>::new());
-        assert_eq!(flow.echo_to[&1], vec![11]);
-        assert_eq!(flow.echo_to[&2], vec![12]);
-        assert_eq!(flow.echo_to[&3], Vec::<NodeId>::new());
-        assert_eq!(flow.echo_to[&12], vec![2]);
-        assert_eq!(flow.echo_to[&11], vec![1]);
-        assert_eq!(flow.echo_to[&10], Vec::<NodeId>::new());
+        assert_eq!(flow.echo_to[&0], HashSet::<NodeId>::new());
+        assert_eq!(
+            flow.echo_to[&1],
+            vec![11].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(
+            flow.echo_to[&2],
+            vec![12].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(flow.echo_to[&3], HashSet::<NodeId>::new());
+        assert_eq!(
+            flow.echo_to[&12],
+            vec![2].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(
+            flow.echo_to[&11],
+            vec![1].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(flow.echo_to[&10], HashSet::<NodeId>::new());
     }
 
     #[test]
     fn test_ring_flow_9_nodes_positive_overflow() {
-        let flow = Flow::ring(&(0..9).into_iter().collect::<Vec<_>>(), 8);
+        let flow = Flow::ring((0..9).into_iter().collect::<Vec<_>>(), 8);
 
-        assert_eq!(flow.diffuse_to[&8], vec![7, 0]);
-        assert_eq!(flow.diffuse_to[&0], vec![1]);
-        assert_eq!(flow.diffuse_to[&1], Vec::<NodeId>::new());
-        assert_eq!(flow.diffuse_to[&7], vec![6]);
-        assert_eq!(flow.diffuse_to[&6], Vec::<NodeId>::new());
+        assert_eq!(
+            flow.diffuse_to[&8],
+            vec![7, 0].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(
+            flow.diffuse_to[&0],
+            vec![1].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(flow.diffuse_to[&1], HashSet::<NodeId>::new());
+        assert_eq!(
+            flow.diffuse_to[&7],
+            vec![6].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(flow.diffuse_to[&6], HashSet::<NodeId>::new());
 
-        assert_eq!(flow.echo_to[&8], Vec::<NodeId>::new());
-        assert_eq!(flow.echo_to[&0], vec![7]);
-        assert_eq!(flow.echo_to[&1], Vec::<NodeId>::new());
-        assert_eq!(flow.echo_to[&7], vec![0]);
-        assert_eq!(flow.echo_to[&6], Vec::<NodeId>::new());
+        assert_eq!(flow.echo_to[&8], HashSet::<NodeId>::new());
+        assert_eq!(
+            flow.echo_to[&0],
+            vec![7].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(flow.echo_to[&1], HashSet::<NodeId>::new());
+        assert_eq!(
+            flow.echo_to[&7],
+            vec![0].into_iter().collect::<HashSet<NodeId>>()
+        );
+        assert_eq!(flow.echo_to[&6], HashSet::<NodeId>::new());
     }
 
     #[test]
     fn test_ring_13_adopted() {
-        let flow = Flow::ring(&(0..13).into_iter().collect::<Vec<_>>(), 6);
+        let flow = Flow::ring((0..13).into_iter().collect::<Vec<_>>(), 6);
 
         assert_eq!(
             flow.adoptions_given_adopted(3),
@@ -223,7 +322,7 @@ mod test {
 
     #[test]
     fn test_ring_9_adopted() {
-        let flow = Flow::ring(&(0..9).into_iter().collect::<Vec<_>>(), 4);
+        let flow = Flow::ring((0..9).into_iter().collect::<Vec<_>>(), 4);
 
         assert_eq!(
             flow.adoptions_given_adopted(2),
@@ -249,7 +348,7 @@ mod test {
 
     #[test]
     fn test_ring_13_acked() {
-        let flow = Flow::ring(&(0..13).into_iter().collect::<Vec<_>>(), 6);
+        let flow = Flow::ring((0..13).into_iter().collect::<Vec<_>>(), 6);
 
         assert_eq!(
             flow.adoptions_given_acked(3),
@@ -289,7 +388,7 @@ mod test {
 
     #[test]
     fn test_ring_9_acked() {
-        let flow = Flow::ring(&(0..9).into_iter().collect::<Vec<_>>(), 4);
+        let flow = Flow::ring((0..9).into_iter().collect::<Vec<_>>(), 4);
 
         assert_eq!(
             flow.adoptions_given_acked(2),
