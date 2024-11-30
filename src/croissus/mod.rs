@@ -36,10 +36,21 @@ enum ProposalSlot {
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 struct LockedState {
-    proposal: ProposalSlot,
+    proposal_slot: ProposalSlot,
     echoes: HashMap<NodeId, HashSet<NodeId>>,
     acks: HashSet<NodeId>,
     done: bool,
+}
+
+impl LockedState {
+    fn new(proposal_slot: ProposalSlot) -> Self {
+        Self {
+            proposal_slot,
+            echoes: HashMap::new(),
+            acks: HashSet::new(),
+            done: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
@@ -60,10 +71,7 @@ struct CroissusState {
     node: NodeId,
     node_flow: Flow,
     majority_threshold: usize,
-    proposal: ProposalSlot,
-    echoes: HashMap<NodeId, HashSet<NodeId>>,
-    acks: HashSet<NodeId>,
-    done: bool,
+    locked_state: LockedState,
     finish_adopt_commit_phase: Option<oneshot::Sender<()>>,
     finish_lock_phase: Option<oneshot::Sender<Option<Command>>>,
     fetched_states: HashMap<NodeId, LockedState>,
@@ -75,10 +83,7 @@ impl CroissusState {
             node,
             node_flow,
             majority_threshold: nodes / 2 + 1,
-            proposal: ProposalSlot::None,
-            echoes: HashMap::new(),
-            acks: HashSet::new(),
-            done: false,
+            locked_state: LockedState::new(ProposalSlot::None),
             finish_adopt_commit_phase: None,
             finish_lock_phase: None,
             fetched_states: HashMap::new(),
@@ -86,7 +91,7 @@ impl CroissusState {
     }
 
     fn can_ack(&self) -> bool {
-        match &self.proposal {
+        match &self.locked_state.proposal_slot {
             ProposalSlot::None | ProposalSlot::Tombstone => false, //TODO: You cannot ack if you've got a TOMBSTONE
             ProposalSlot::Proposal(proposal) => {
                 // The variable should_have_echoed from the pseudocode is a set of nodes which
@@ -94,7 +99,7 @@ impl CroissusState {
                 // the set of nodes that the current node echoes. Then, this set of nodes needs to
                 // be a subset of the echoes the node has received for the proposal's proposer.
                 // (Only 1 proposal can be sent by a proposer at a certain slot)
-                if let Some(echoes) = self.echoes.get(&proposal.proposer) {
+                if let Some(echoes) = self.locked_state.echoes.get(&proposal.proposer) {
                     if !proposal.flow.echo_to[&self.node]
                         .difference(echoes)
                         .next()
@@ -107,7 +112,7 @@ impl CroissusState {
                 // All nodes which the current node forwards the proposal must ack
                 // before the current node can ack.
                 if !proposal.flow.diffuse_to[&self.node]
-                    .difference(&self.acks)
+                    .difference(&self.locked_state.acks)
                     .next()
                     .is_none()
                 {
@@ -120,7 +125,7 @@ impl CroissusState {
     }
 
     fn locked(&self) -> bool {
-        match self.proposal {
+        match self.locked_state.proposal_slot {
             ProposalSlot::None => false,
             ProposalSlot::Tombstone | ProposalSlot::Proposal(_) => true,
         }
@@ -128,15 +133,10 @@ impl CroissusState {
 
     fn lock(&mut self) -> LockedState {
         if !self.locked() {
-            self.proposal = ProposalSlot::Tombstone;
+            self.locked_state.proposal_slot = ProposalSlot::Tombstone;
         }
 
-        LockedState {
-            proposal: self.proposal.clone(),
-            echoes: self.echoes.clone(),
-            acks: self.acks.clone(),
-            done: self.done,
-        }
+        self.locked_state.clone()
     }
 
     fn propose(&mut self, command: Command) -> (Proposal, oneshot::Receiver<()>) {
@@ -146,7 +146,7 @@ impl CroissusState {
             flow: self.node_flow.clone(),
         };
 
-        self.proposal = ProposalSlot::Proposal(proposal.clone());
+        self.locked_state.proposal_slot = ProposalSlot::Proposal(proposal.clone());
 
         let (send, recv) = oneshot::channel();
         self.finish_adopt_commit_phase.replace(send);
@@ -166,14 +166,14 @@ impl CroissusState {
         if self.locked() {
             bail!("Node {} is locked, aborting diffuse", self.node); // TODO: Send NACK optimization
         }
-        self.proposal = ProposalSlot::Proposal(proposal);
+        self.locked_state.proposal_slot = ProposalSlot::Proposal(proposal);
 
         Ok(())
     }
 
     fn try_ack(&mut self, proposal: Proposal) -> Option<(NodeId, Message)> {
         if self.can_ack() {
-            self.done = true;
+            self.locked_state.done = true;
             let predecessor = proposal
                 .flow
                 .diffuse_to
@@ -231,11 +231,11 @@ impl CroissusState {
         let mut proposed_commands = HashMap::new();
 
         for (node, state) in &self.fetched_states {
-            match &state.proposal {
+            match &state.proposal_slot {
                 ProposalSlot::None => {
                     error!(
                         "Node {} fetched {:?} from {}",
-                        self.node, state.proposal, node
+                        self.node, state.proposal_slot, node
                     );
                     panic!(
                         "Node {} responded to Lock message with {:?}",
@@ -344,7 +344,7 @@ impl Croissus {
 
         {
             let mut state = self.state.lock().await;
-            if state.done {
+            if state.locked_state.done {
                 println!("COMMITTED {:?}", command);
                 return Ok(());
             }
@@ -447,7 +447,7 @@ impl Croissus {
             self.network.node, proposal, from
         );
         let mut state = self.state.lock().await;
-        let echoes = state.echoes.entry(proposal.proposer).or_default();
+        let echoes = state.locked_state.echoes.entry(proposal.proposer).or_default();
         echoes.insert(from);
 
         // TODO: Is it possible for 2 proposal's from different nodes to have the same echo?
@@ -463,11 +463,11 @@ impl Croissus {
             self.network.node, proposal, from
         );
         let mut state = self.state.lock().await;
-        state.acks.insert(from);
+        state.locked_state.acks.insert(from);
 
         if self.network.node == proposal.proposer {
             if state.can_ack() {
-                state.done = true;
+                state.locked_state.done = true;
                 match state.finish_adopt_commit_phase.take() {
                     None => {
                         error!(
