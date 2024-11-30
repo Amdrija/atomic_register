@@ -51,6 +51,11 @@ enum Message {
     LockReply(LockedState),
 }
 
+enum CroissusResult {
+    Committed(Command),
+    Adopted(Option<Command>),
+}
+
 struct CroissusState {
     node: NodeId,
     node_flow: Flow,
@@ -108,8 +113,6 @@ impl CroissusState {
                 {
                     return false;
                 }
-
-                //TODO: Have the timeout deadline embedded in the proposal
 
                 true
             }
@@ -191,7 +194,7 @@ impl CroissusState {
 
             let mut command = None;
             for (proposer, fetched) in fetched_count {
-                if fetched + deduced_count[&proposer] >= self.majority_threshold {
+                if fetched + deduced_count.get(&proposer).cloned().unwrap_or_default() >= self.majority_threshold {
                     command = proposed_commands.remove(&proposer);
                     break;
                 }
@@ -310,12 +313,11 @@ impl Croissus {
         self.cancellation_token.cancel()
     }
 
-    pub async fn propose(&self, command: Command) -> Result<()> {
-        match self.try_commit(command).await {
-            Ok(_) => Ok(()),
+    pub async fn propose(&self, command: Command) -> CroissusResult {
+        match self.try_commit(command.clone()).await {
+            Ok(_) => CroissusResult::Committed(command),
             Err(_) => {
-                println!("ADOPTED {:?}", self.get_safe_value().await);
-                Ok(())
+                CroissusResult::Adopted(self.get_safe_value().await)
             }
         }
     }
@@ -515,7 +517,7 @@ impl Croissus {
 mod tests {
     use crate::command::{Command, CommandKind, WriteCommand};
     use crate::core::{create_channel_network, NodeId};
-    use crate::croissus::Croissus;
+    use crate::croissus::{Croissus, CroissusResult};
     use std::collections::HashMap;
     use std::env::set_var;
     use std::time::Duration;
@@ -537,31 +539,56 @@ mod tests {
             let (croissus, join_handle) = Croissus::new(
                 network,
                 nodes.clone(),
-                Duration::from_millis(1000),
+                Duration::from_millis(100),
                 receive_channel,
             );
-            croissuses.insert(node, croissus);
+            croissuses.insert(node.clone(), croissus);
             spawned_tasks.push(join_handle);
         }
 
-        croissuses[&4]
-            .propose(Command {
+        let c4 = croissuses.remove(&4).unwrap();
+        let c3 = croissuses.remove(&3).unwrap();
+        let f1 = tokio::spawn(async move {
+            c4.propose(Command {
                 id: 1,
                 client_id: 69,
                 command_kind: CommandKind::Write(WriteCommand { key: 1, value: 10 }),
-            })
-            .await
-            .unwrap();
+            }).await
+        });
+        let f2= tokio::spawn(async move {
+            c3.propose(Command {
+                id: 2,
+                client_id: 70,
+                command_kind: CommandKind::Write(WriteCommand { key: 12, value: 102 }),
+            }).await
+        });
 
-        croissuses[&3]
-            .propose(Command {
-                id: 1,
-                client_id: 69,
-                command_kind: CommandKind::Write(WriteCommand { key: 1, value: 10 }),
-            })
-            .await
-            .unwrap();
+        let result1 = f1.await;
+        assert!(result1.is_ok());
 
-        assert!(false);
+        let result2 = f2.await;
+        assert!(result2.is_ok());
+        assert!(is_valid(&vec![result1.unwrap(), result2.unwrap()]));
+    }
+
+    fn is_valid(results: &Vec<CroissusResult>) -> bool {
+        let committed = results.iter().filter_map(|result| match result {
+            CroissusResult::Committed(command) => Some(command),
+            CroissusResult::Adopted(_) => None
+        }).collect::<Vec<_>>();
+
+        if committed.len() > 1 {
+            return false;
+        }
+
+        if committed.len() == 0 {
+            return true;
+        }
+
+        let committed = committed[0];
+        results.iter().all(|result| match result {
+            CroissusResult::Committed(command) => command == committed,
+            CroissusResult::Adopted(command) => command.as_ref().map(|command| command == committed).is_some()
+        })
     }
 }
