@@ -1,15 +1,12 @@
 use crate::command::Command;
 use crate::core::{NodeId, Packet, VirtualNetwork};
 use crate::croissus::flow::Flow;
-use anyhow::{bail, Result};
-use futures::future::err;
+use anyhow::{anyhow, bail, Result};
 use log::{debug, error, info};
 use rkyv::{Archive, Deserialize, Serialize};
 use std::collections::hash_map::Entry::Vacant;
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::sync::Arc;
-use std::thread::sleep;
 use std::time::Duration;
 use tokio::select;
 use tokio::sync::mpsc::Receiver;
@@ -54,7 +51,7 @@ impl LockedState {
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
-enum Message {
+enum MessageKind {
     Diffuse(Proposal),
     Echo(Proposal),
     Ack(Proposal), // Does an ack need to be identified?
@@ -62,18 +59,42 @@ enum Message {
     LockReply(LockedState),
 }
 
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+struct Message {
+    index: usize,
+    kind: MessageKind,
+}
+
+#[derive(Debug)]
 enum CroissusResult {
     Committed(Command),
     Adopted(Option<Command>),
+}
+
+impl CroissusResult {
+    fn is_committed(&self) -> bool {
+        match self {
+            CroissusResult::Committed(_) => true,
+            _ => false,
+        }
+    }
+
+    fn is_adopted(&self) -> bool {
+        match self {
+            CroissusResult::Adopted(_) => true,
+            _ => false,
+        }
+    }
 }
 
 struct CroissusState {
     node: NodeId,
     node_flow: Flow,
     majority_threshold: usize,
-    locked_state: LockedState,
-    finish_adopt_commit_phase: Option<oneshot::Sender<()>>,
-    finish_lock_phase: Option<oneshot::Sender<Option<Command>>>,
+    log: Vec<Option<LockedState>>,
+    current_index: usize,
+    finish_adopt_commit_phase: Option<Sender<()>>,
+    finish_lock_phase: Option<Sender<Option<Command>>>,
     fetched_states: HashMap<NodeId, LockedState>,
 }
 
@@ -83,104 +104,198 @@ impl CroissusState {
             node,
             node_flow,
             majority_threshold: nodes / 2 + 1,
-            locked_state: LockedState::new(ProposalSlot::None),
+            log: vec![Some(LockedState::new(ProposalSlot::Tombstone))],
+            current_index: 0,
             finish_adopt_commit_phase: None,
             finish_lock_phase: None,
             fetched_states: HashMap::new(),
         }
     }
 
-    fn can_ack(&self) -> bool {
-        match &self.locked_state.proposal_slot {
-            ProposalSlot::None | ProposalSlot::Tombstone => false, //TODO: You cannot ack if you've got a TOMBSTONE
-            ProposalSlot::Proposal(proposal) => {
-                // The variable should_have_echoed from the pseudocode is a set of nodes which
-                // should echo the current node. Since echoes are symmetrical, we can just use
-                // the set of nodes that the current node echoes. Then, this set of nodes needs to
-                // be a subset of the echoes the node has received for the proposal's proposer.
-                // (Only 1 proposal can be sent by a proposer at a certain slot)
-                if let Some(echoes) = self.locked_state.echoes.get(&proposal.proposer) {
-                    if !proposal.flow.echo_to[&self.node]
-                        .difference(echoes)
-                        .next()
-                        .is_none()
-                    {
-                        return false;
-                    }
-                }
+    fn can_ack(&self, index: usize) -> bool {
+        if index >= self.log.len() {
+            // The log currently doesn't have anything at the index, so there's nothing to ack
+            // Shouldn't be possible to trigger with the way algorithm works
+            return false;
+        }
 
-                // All nodes which the current node forwards the proposal must ack
-                // before the current node can ack.
-                if !proposal.flow.diffuse_to[&self.node]
-                    .difference(&self.locked_state.acks)
-                    .next()
-                    .is_none()
-                {
+        match &self.log[index] {
+            None => false, // If nothing at index then nothing that can be acked
+            Some(locked_state) => {
+                if locked_state.done {
                     return false;
                 }
 
-                true
+                match &locked_state.proposal_slot {
+                    ProposalSlot::None | ProposalSlot::Tombstone => false, //TODO: You cannot ack if you've got a TOMBSTONE
+                    ProposalSlot::Proposal(proposal) => {
+                        // The variable should_have_echoed from the pseudocode is a set of nodes which
+                        // should echo the current node. Since echoes are symmetrical, we can just use
+                        // the set of nodes that the current node echoes. Then, this set of nodes needs to
+                        // be a subset of the echoes the node has received for the proposal's proposer.
+                        // (Only 1 proposal can be sent by a proposer at a certain slot)
+                        if !proposal.flow.echo_to[&self.node]
+                            .difference(
+                                &locked_state
+                                    .echoes
+                                    .get(&proposal.proposer)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            )
+                            .next()
+                            .is_none()
+                        {
+                            return false;
+                        }
+
+                        // All nodes which the current node forwards the proposal must ack
+                        // before the current node can ack.
+                        if !proposal.flow.diffuse_to[&self.node]
+                            .difference(&locked_state.acks)
+                            .next()
+                            .is_none()
+                        {
+                            return false;
+                        }
+
+                        true
+                    }
+                }
             }
         }
     }
 
-    fn locked(&self) -> bool {
-        match self.locked_state.proposal_slot {
-            ProposalSlot::None => false,
-            ProposalSlot::Tombstone | ProposalSlot::Proposal(_) => true,
+    fn locked(&self, index: usize) -> bool {
+        if index >= self.log.len() {
+            return false;
+        }
+
+        match &self.log[index] {
+            None => false,
+            Some(locked_state) => match locked_state.proposal_slot {
+                ProposalSlot::None => false,
+                ProposalSlot::Tombstone | ProposalSlot::Proposal(_) => true,
+            },
         }
     }
 
-    fn lock(&mut self) -> LockedState {
-        if !self.locked() {
-            self.locked_state.proposal_slot = ProposalSlot::Tombstone;
+    fn lock(&mut self, index: usize) -> LockedState {
+        if !self.locked(index) {
+            self.set_log(index, ProposalSlot::Tombstone);
         }
 
-        self.locked_state.clone()
+        match &self.log[index] {
+            None => {
+                error!(
+                    "Node {} tried to lock index {} with empty slot",
+                    self.node, index
+                );
+                panic!(
+                    "Node {} tried to lock index {} with empty slot",
+                    self.node, index
+                );
+            }
+            Some(locked_state) => locked_state.clone(),
+        }
     }
 
-    fn propose(&mut self, command: Command) -> (Proposal, oneshot::Receiver<()>) {
+    fn set_log(&mut self, index: usize, proposal_slot: ProposalSlot) {
+        if index >= self.log.len() {
+            self.log.resize(index + 1, None);
+        }
+        self.log[index] = Some(LockedState::new(proposal_slot));
+    }
+
+    fn propose(&mut self, command: Command) -> (Proposal, usize, oneshot::Receiver<()>) {
         let proposal = Proposal {
             command,
             proposer: self.node,
             flow: self.node_flow.clone(),
         };
 
-        self.locked_state.proposal_slot = ProposalSlot::Proposal(proposal.clone());
+        self.current_index = self.first_unlocked_index();
+        // TODO: It is possible that a slot for which the node receives an echo is overridden
+        // However, this shouldn't impact the algorithm, as the echoed proposal will never be
+        // echoed by this node (because it sets another proposal here, so it is locked). Therefore,
+        // the node's sibling will never ack, so the sibling's echoed proposal will never
+        // be committed. I think that also this proposal will never be committed as well.
+        self.set_log(self.current_index, ProposalSlot::Proposal(proposal.clone()));
 
         let (send, recv) = oneshot::channel();
         self.finish_adopt_commit_phase.replace(send);
 
-        (proposal, recv)
+        (proposal, self.current_index, recv)
     }
 
-    fn go_to_lock_phase(&mut self) -> oneshot::Receiver<Option<Command>> {
+    fn first_unlocked_index(&self) -> usize {
+        // Basically, it is possible to have a slot here which doesn't have a proposal,
+        // but it has received an echo from a sibling
+        (0..self.log.len())
+            .find(|index| !self.locked(*index))
+            .unwrap_or(self.log.len())
+    }
+
+    fn go_to_lock_phase(&mut self) -> (usize, oneshot::Receiver<Option<Command>>) {
         let (finish_lock_phase, lock_phase_finished) = oneshot::channel();
         self.finish_lock_phase.replace(finish_lock_phase);
         self.fetched_states.clear();
 
-        lock_phase_finished
+        (self.current_index, lock_phase_finished)
     }
 
-    fn process_diffuse(&mut self, proposal: Proposal) -> Result<()> {
-        if self.locked() {
+    fn process_diffuse(&mut self, index: usize, proposal: Proposal) -> Result<()> {
+        if self.locked(index) {
             bail!("Node {} is locked, aborting diffuse", self.node); // TODO: Send NACK optimization
         }
-        self.locked_state.proposal_slot = ProposalSlot::Proposal(proposal);
+
+        // TODO: It is possible that a slot for which the node receives an echo is overridden
+        // However, this shouldn't impact the algorithm, as the echoed proposal will never be
+        // echoed by this node (because it sets another proposal here, so it is locked). Therefore,
+        // the node's sibling will never ack, so the sibling's echoed proposal will never
+        // be committed. I think that also this proposal will never be committed as well.
+        self.set_log(index, ProposalSlot::Proposal(proposal));
 
         Ok(())
     }
 
-    fn try_ack(&mut self, proposal: Proposal) -> Option<(NodeId, Message)> {
-        if self.can_ack() {
-            self.locked_state.done = true;
+    fn process_echo(
+        &mut self,
+        from: NodeId,
+        index: usize,
+        proposal: Proposal,
+    ) -> Option<(NodeId, Message)> {
+        if index >= self.log.len() {
+            self.set_log(index, ProposalSlot::None);
+        }
+
+        let echoes = self.log[index]
+            .as_mut()
+            .unwrap()
+            .echoes
+            .entry(proposal.proposer)
+            .or_default();
+        echoes.insert(from);
+        self.try_ack(index, proposal)
+    }
+
+    fn try_ack(&mut self, index: usize, proposal: Proposal) -> Option<(NodeId, Message)> {
+        if self.can_ack(index) {
+            self.log[index].as_mut().unwrap().done = true;
             let predecessor = proposal
                 .flow
                 .diffuse_to
                 .iter()
-                .find(|(predecessor, diffuses_to)| diffuses_to.contains(&self.node))
+                .find(|(_, diffuses_to)| diffuses_to.contains(&self.node))
                 .map(|(predecessor, _)| *predecessor);
-            return predecessor.map(|predecessor| (predecessor, Message::Ack(proposal)));
+            return predecessor.map(|predecessor| {
+                (
+                    predecessor,
+                    Message {
+                        index,
+                        kind: MessageKind::Ack(proposal),
+                    },
+                )
+            });
         }
 
         None
@@ -194,7 +309,9 @@ impl CroissusState {
 
             let mut command = None;
             for (proposer, fetched) in fetched_count {
-                if fetched + deduced_count.get(&proposer).cloned().unwrap_or_default() >= self.majority_threshold {
+                if fetched + deduced_count.get(&proposer).cloned().unwrap_or_default()
+                    >= self.majority_threshold
+                {
                     command = proposed_commands.remove(&proposer);
                     break;
                 }
@@ -310,31 +427,39 @@ impl Croissus {
     }
 
     pub fn quit(&self) {
+        info!("Node {} shutting down", self.network.node);
         self.cancellation_token.cancel()
     }
 
-    pub async fn propose(&self, command: Command) -> CroissusResult {
-        match self.try_commit(command.clone()).await {
-            Ok(_) => CroissusResult::Committed(command),
-            Err(_) => {
-                CroissusResult::Adopted(self.get_safe_value().await)
-            }
-        }
+    pub async fn propose(&self, command: Command) -> (usize, CroissusResult) {
+        let (index, result) = self.try_commit(command.clone()).await;
+        (
+            index,
+            match result {
+                Ok(_) => {
+                    println!("COMMITTED {:?}", command);
+                    CroissusResult::Committed(command)
+                }
+                Err(_) => {
+                    let adopted_command = self.get_safe_value().await;
+                    println!("ADOPTED {:?}", adopted_command);
+                    CroissusResult::Adopted(self.get_safe_value().await)
+                }
+            },
+        )
     }
 
-    async fn try_commit(&self, command: Command) -> Result<()> {
-        let (proposal, finished_propose) = {
+    async fn try_commit(&self, command: Command) -> (usize, Result<()>) {
+        let (proposal, index, finished_propose) = {
             let mut state = self.state.lock().await;
-            if state.locked() {
-                error!("Node {} state is locked, cannot propose", self.network.node);
-                bail!("Nodes state is locked, it must adopt");
-            }
+            // Don't have to check if the slot is locked, since the propose will
+            // automatically pick the next unlocked slot
             state.propose(command.clone())
         };
 
         let timeout = tokio::time::sleep(self.timeout);
 
-        self.diffuse_proposal(proposal).await;
+        self.diffuse_proposal(index, proposal).await;
         select! {
             _ = timeout => {
                 debug!("Node {} ack timeout elapsed", self.network.node);
@@ -343,36 +468,54 @@ impl Croissus {
         }
 
         {
-            let mut state = self.state.lock().await;
-            if state.locked_state.done {
-                println!("COMMITTED {:?}", command);
-                return Ok(());
+            let state = self.state.lock().await;
+            if state
+                .log
+                .get(state.current_index)
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .done
+            {
+                return (index, Ok(()));
             }
         }
 
-        bail!("Node couldn't commit, it must adopt")
+        (index, Err(anyhow!("Node couldn't commit, it must adopt")))
     }
 
-    async fn diffuse_proposal(&self, proposal: Proposal) {
+    async fn diffuse_proposal(&self, index: usize, proposal: Proposal) {
         for destination in &proposal.flow.diffuse_to[&self.network.node] {
             debug!(
                 "Node {} sending diffuse {:?} to {}",
                 self.network.node, proposal, destination
             );
             self.network
-                .send(*destination, Message::Diffuse(proposal.clone()))
+                .send(
+                    *destination,
+                    Message {
+                        index,
+                        kind: MessageKind::Diffuse(proposal.clone()),
+                    },
+                )
                 .await
                 .unwrap()
         }
     }
 
     async fn get_safe_value(&self) -> Option<Command> {
-        let lock_phase_finished = {
+        let (index, lock_phase_finished) = {
             let mut state = self.state.lock().await;
             state.go_to_lock_phase()
         };
 
-        self.network.broadcast(Message::Lock).await.unwrap();
+        self.network
+            .broadcast(Message {
+                index,
+                kind: MessageKind::Lock,
+            })
+            .await
+            .unwrap();
 
         let result = lock_phase_finished.await;
         if let Err(error) = result {
@@ -393,12 +536,12 @@ impl Croissus {
                     }
 
                     let packet = result.unwrap();
-                    match packet.data {
-                        Message::Diffuse(proposal) => self.process_diffuse(packet.from, proposal).await,
-                        Message::Echo(proposal) => self.process_echo(packet.from, proposal).await,
-                        Message::Ack(proposal) => self.process_ack(packet.from, proposal).await,
-                        Message::Lock => self.process_lock(packet.from).await,
-                        Message::LockReply(locked_state) => self.process_lock_reply(packet.from, locked_state).await
+                    match packet.data.kind {
+                        MessageKind::Diffuse(proposal) => self.process_diffuse(packet.from, packet.data.index, proposal).await,
+                        MessageKind::Echo(proposal) => self.process_echo(packet.from, packet.data.index, proposal).await,
+                        MessageKind::Ack(proposal) => self.process_ack(packet.from, packet.data.index, proposal).await,
+                        MessageKind::Lock => self.process_lock(packet.from, packet.data.index).await,
+                        MessageKind::LockReply(locked_state) => self.process_lock_reply(packet.from, packet.data.index, locked_state).await
                     };
                 }
                 _ = self.cancellation_token.cancelled() => {
@@ -409,14 +552,14 @@ impl Croissus {
         }
     }
 
-    async fn process_diffuse(&self, from: NodeId, proposal: Proposal) {
+    async fn process_diffuse(&self, from: NodeId, index: usize, proposal: Proposal) {
         debug!(
             "Node {} received diffuse {:?} from {}",
             self.network.node, proposal, from
         );
         let mut state = self.state.lock().await;
 
-        let diffuse_result = state.process_diffuse(proposal.clone());
+        let diffuse_result = state.process_diffuse(index, proposal.clone());
         if let Err(error) = diffuse_result {
             debug!("{error}");
             return; // TODO: Return negative ack
@@ -428,46 +571,60 @@ impl Croissus {
                 self.network.node, proposal, sibling
             );
             self.network
-                .send(*sibling, Message::Echo(proposal.clone()))
+                .send(
+                    *sibling,
+                    Message {
+                        index,
+                        kind: MessageKind::Echo(proposal.clone()),
+                    },
+                )
                 .await
                 .unwrap();
         }
 
-        self.diffuse_proposal(proposal.clone()).await;
+        self.diffuse_proposal(index, proposal.clone()).await;
 
-        if let Some((destination, message)) = state.try_ack(proposal) {
+        if let Some((destination, message)) = state.try_ack(index, proposal) {
             debug!("Node {} sending ack to {}", self.network.node, destination);
             self.network.send(destination, message).await.unwrap()
         }
     }
 
-    async fn process_echo(&self, from: NodeId, proposal: Proposal) {
+    async fn process_echo(&self, from: NodeId, index: usize, proposal: Proposal) {
         debug!(
             "Node {} received echo {:?} from {}",
             self.network.node, proposal, from
         );
         let mut state = self.state.lock().await;
-        let echoes = state.locked_state.echoes.entry(proposal.proposer).or_default();
-        echoes.insert(from);
 
         // TODO: Is it possible for 2 proposal's from different nodes to have the same echo?
-        if let Some((destination, message)) = state.try_ack(proposal) {
+        if let Some((destination, message)) = state.process_echo(from, index, proposal) {
             debug!("Node {} sending ack to {}", self.network.node, destination);
             self.network.send(destination, message).await.unwrap()
         }
     }
 
-    async fn process_ack(&self, from: NodeId, proposal: Proposal) {
+    async fn process_ack(&self, from: NodeId, index: usize, proposal: Proposal) {
         debug!(
             "Node {} received ack {:?} from {}",
             self.network.node, proposal, from
         );
         let mut state = self.state.lock().await;
-        state.locked_state.acks.insert(from);
+        if index >= state.log.len() {
+            // TODO: Most likely not needed, since an ack has to come after we set proposal (as a response to diffuse)
+            state.set_log(index, ProposalSlot::None);
+        }
+
+        state.log[index].as_mut().unwrap().acks.insert(from);
 
         if self.network.node == proposal.proposer {
-            if state.can_ack() {
-                state.locked_state.done = true;
+            // If the ack was delayed, ignore it
+            if state.current_index != index {
+                return;
+            }
+
+            if state.can_ack(index) {
+                state.log[index].as_mut().unwrap().done = true;
                 match state.finish_adopt_commit_phase.take() {
                     None => {
                         error!(
@@ -482,48 +639,136 @@ impl Croissus {
                     }
                 };
             }
-        } else if let Some((destination, message)) = state.try_ack(proposal) {
+        } else if let Some((destination, message)) = state.try_ack(index, proposal) {
             debug!("Node {} sending ack to {}", self.network.node, destination);
             self.network.send(destination, message).await.unwrap()
         }
     }
 
-    async fn process_lock(&self, from: NodeId) {
+    async fn process_lock(&self, from: NodeId, index: usize) {
         debug!("Node {} received lock from {}", self.network.node, from);
         let mut state = self.state.lock().await;
-        let locked_state = state.lock();
+        let locked_state = state.lock(index);
 
         debug!(
             "Node {} sending lock reply {:?} to {}",
             self.network.node, locked_state, from
         );
         self.network
-            .send(from, Message::LockReply(locked_state))
+            .send(
+                from,
+                Message {
+                    index,
+                    kind: MessageKind::LockReply(locked_state),
+                },
+            )
             .await
             .unwrap()
     }
 
-    async fn process_lock_reply(&self, from: NodeId, locked_state: LockedState) {
+    async fn process_lock_reply(&self, from: NodeId, index: usize, locked_state: LockedState) {
         debug!(
             "Node {} received lock reply {:?} from {}",
             self.network.node, locked_state, from
         );
         let mut state = self.state.lock().await;
+        if state.current_index != index {
+            return;
+        }
         state.process_lock_reply(from, locked_state);
+    }
+
+    pub async fn get_log(&self) -> Vec<Option<LockedState>> {
+        self.state.lock().await.log.clone()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::command::{Command, CommandKind, WriteCommand};
-    use crate::core::{create_channel_network, NodeId};
+    use crate::core::create_channel_network;
     use crate::croissus::{Croissus, CroissusResult};
+    use futures::future::TryJoinAll;
     use std::collections::HashMap;
     use std::env::set_var;
     use std::time::Duration;
 
     #[tokio::test]
-    async fn test_croissus() {
+    async fn test_croissus_synchronous() {
+        unsafe {
+            set_var("RUST_LOG", "TRACE");
+        }
+        pretty_env_logger::init_timed();
+        let nodes = (0..9).into_iter().collect::<Vec<_>>();
+        let (mut virtual_networks, mut receivers) = create_channel_network(nodes.clone());
+
+        let mut croissuses = HashMap::new();
+        let mut spawned_tasks = Vec::new();
+        for node in &nodes {
+            let network = virtual_networks.remove(node).unwrap();
+            let receive_channel = receivers.remove(node).unwrap();
+            let (croissus, join_handle) = Croissus::new(
+                network,
+                nodes.clone(),
+                Duration::from_millis(100),
+                receive_channel,
+            );
+            croissuses.insert(node.clone(), croissus);
+            spawned_tasks.push(join_handle);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let mut adopt_commit_log = HashMap::new();
+        for proposer in &nodes {
+            let (index, croissus_result) = croissuses[proposer]
+                .propose(Command {
+                    id: *proposer as u64,
+                    client_id: *proposer as u64,
+                    command_kind: CommandKind::Write(WriteCommand {
+                        key: *proposer as u64,
+                        value: 10 + *proposer as u32,
+                    }),
+                })
+                .await;
+            adopt_commit_log
+                .entry(index)
+                .or_insert(Vec::new())
+                .push(croissus_result);
+
+            for other in nodes.iter().filter(|node| *node != proposer) {
+                let (index, croissus_result) = croissuses[other]
+                    .propose(Command {
+                        id: *other as u64,
+                        client_id: *other as u64,
+                        command_kind: CommandKind::Write(WriteCommand {
+                            key: *other as u64,
+                            value: 10 + *other as u32,
+                        }),
+                    })
+                    .await;
+                adopt_commit_log
+                    .entry(index)
+                    .or_insert(Vec::new())
+                    .push(croissus_result);
+            }
+        }
+
+        assert!(adopt_commit_log.values().all(|results| is_valid(results)));
+
+        for (_, croissus) in croissuses.drain() {
+            croissus.quit();
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        spawned_tasks
+            .into_iter()
+            .collect::<TryJoinAll<_>>()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_croissus_concurrent() {
         unsafe {
             set_var("RUST_LOG", "TRACE");
         }
@@ -546,36 +791,67 @@ mod tests {
             spawned_tasks.push(join_handle);
         }
 
-        let c4 = croissuses.remove(&4).unwrap();
-        let c3 = croissuses.remove(&3).unwrap();
+        let c4 = croissuses.remove(&2).unwrap();
+        let c3 = croissuses.remove(&5).unwrap();
+        let c3_clone = c3.clone();
+        let c4_clone = c4.clone();
         let f1 = tokio::spawn(async move {
-            c4.propose(Command {
-                id: 1,
-                client_id: 69,
-                command_kind: CommandKind::Write(WriteCommand { key: 1, value: 10 }),
-            }).await
+            c4_clone
+                .propose(Command {
+                    id: 1,
+                    client_id: 69,
+                    command_kind: CommandKind::Write(WriteCommand { key: 1, value: 10 }),
+                })
+                .await
         });
-        let f2= tokio::spawn(async move {
-            c3.propose(Command {
-                id: 2,
-                client_id: 70,
-                command_kind: CommandKind::Write(WriteCommand { key: 12, value: 102 }),
-            }).await
+        let f2 = tokio::spawn(async move {
+            c3_clone
+                .propose(Command {
+                    id: 2,
+                    client_id: 70,
+                    command_kind: CommandKind::Write(WriteCommand {
+                        key: 12,
+                        value: 102,
+                    }),
+                })
+                .await
         });
 
         let result1 = f1.await;
         assert!(result1.is_ok());
+        let (index1, result1) = result1.unwrap();
 
         let result2 = f2.await;
         assert!(result2.is_ok());
-        assert!(is_valid(&vec![result1.unwrap(), result2.unwrap()]));
+        let (index2, result2) = result2.unwrap();
+        if index1 == index2 {
+            assert!(is_valid(&vec![result1, result2]));
+        } else {
+            assert!(result1.is_committed());
+            assert!(result2.is_committed());
+        }
+
+        c3.quit();
+        c4.quit();
+        for (_, croissus) in croissuses.drain() {
+            croissus.quit();
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        spawned_tasks
+            .into_iter()
+            .collect::<TryJoinAll<_>>()
+            .await
+            .unwrap();
     }
 
     fn is_valid(results: &Vec<CroissusResult>) -> bool {
-        let committed = results.iter().filter_map(|result| match result {
-            CroissusResult::Committed(command) => Some(command),
-            CroissusResult::Adopted(_) => None
-        }).collect::<Vec<_>>();
+        let committed = results
+            .iter()
+            .filter_map(|result| match result {
+                CroissusResult::Committed(command) => Some(command),
+                CroissusResult::Adopted(_) => None,
+            })
+            .collect::<Vec<_>>();
 
         if committed.len() > 1 {
             return false;
@@ -588,7 +864,10 @@ mod tests {
         let committed = committed[0];
         results.iter().all(|result| match result {
             CroissusResult::Committed(command) => command == committed,
-            CroissusResult::Adopted(command) => command.as_ref().map(|command| command == committed).is_some()
+            CroissusResult::Adopted(command) => command
+                .as_ref()
+                .map(|command| command == committed)
+                .is_some(),
         })
     }
 }
