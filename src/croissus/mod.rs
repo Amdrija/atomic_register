@@ -51,18 +51,41 @@ impl LockedState {
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
-enum MessageKind {
-    Diffuse(Proposal),
-    Echo(Proposal),
-    Ack(Proposal), // Does an ack need to be identified?
-    Lock,
-    LockReply(LockedState),
+struct DiffuseMessage {
+    index: usize,
+    proposal: Proposal,
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
-struct Message {
+struct EchoMessage {
     index: usize,
-    kind: MessageKind,
+    proposal: Proposal,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+struct AckMessage {
+    index: usize,
+    proposal: Proposal,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+struct LockMessage {
+    index: usize,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+struct LockReplyMessage {
+    index: usize,
+    locked_state: LockedState,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+enum MessageKind {
+    Diffuse(DiffuseMessage),
+    Echo(EchoMessage),
+    Ack(AckMessage), // Does an ack need to be identified?
+    Lock(LockMessage),
+    LockReply(LockReplyMessage),
 }
 
 #[derive(Debug)]
@@ -263,7 +286,7 @@ impl CroissusState {
         from: NodeId,
         index: usize,
         proposal: Proposal,
-    ) -> Option<(NodeId, Message)> {
+    ) -> Option<(NodeId, MessageKind)> {
         if index >= self.log.len() {
             self.set_log(index, ProposalSlot::None);
         }
@@ -278,7 +301,7 @@ impl CroissusState {
         self.try_ack(index, proposal)
     }
 
-    fn try_ack(&mut self, index: usize, proposal: Proposal) -> Option<(NodeId, Message)> {
+    fn try_ack(&mut self, index: usize, proposal: Proposal) -> Option<(NodeId, MessageKind)> {
         if self.can_ack(index) {
             self.log[index].as_mut().unwrap().done = true;
             let predecessor = proposal
@@ -290,10 +313,7 @@ impl CroissusState {
             return predecessor.map(|predecessor| {
                 (
                     predecessor,
-                    Message {
-                        index,
-                        kind: MessageKind::Ack(proposal),
-                    },
+                    MessageKind::Ack(AckMessage { index, proposal }),
                 )
             });
         }
@@ -392,7 +412,7 @@ impl CroissusState {
 }
 
 struct Croissus {
-    network: VirtualNetwork<Message>,
+    network: VirtualNetwork<MessageKind>,
     state: Arc<Mutex<CroissusState>>,
     timeout: Duration,
     cancellation_token: CancellationToken,
@@ -400,10 +420,10 @@ struct Croissus {
 
 impl Croissus {
     pub fn new(
-        network: VirtualNetwork<Message>,
+        network: VirtualNetwork<MessageKind>,
         nodes: Vec<NodeId>,
         rtt: Duration,
-        receive_channel: Receiver<Packet<Message>>,
+        receive_channel: Receiver<Packet<MessageKind>>,
     ) -> (Arc<Self>, JoinHandle<()>) {
         let node = network.node;
 
@@ -493,10 +513,10 @@ impl Croissus {
             self.network
                 .send(
                     *destination,
-                    Message {
+                    MessageKind::Diffuse(DiffuseMessage {
                         index,
-                        kind: MessageKind::Diffuse(proposal.clone()),
-                    },
+                        proposal: proposal.clone(),
+                    }),
                 )
                 .await
                 .unwrap()
@@ -510,10 +530,7 @@ impl Croissus {
         };
 
         self.network
-            .broadcast(Message {
-                index,
-                kind: MessageKind::Lock,
-            })
+            .broadcast(MessageKind::Lock(LockMessage { index }))
             .await
             .unwrap();
 
@@ -525,7 +542,7 @@ impl Croissus {
         result.unwrap()
     }
 
-    async fn receive_loop(&self, mut recv_channel: Receiver<Packet<Message>>) {
+    async fn receive_loop(&self, mut recv_channel: Receiver<Packet<MessageKind>>) {
         debug!("Node {} initialized recv loop", self.network.node);
         loop {
             select! {
@@ -536,12 +553,12 @@ impl Croissus {
                     }
 
                     let packet = result.unwrap();
-                    match packet.data.kind {
-                        MessageKind::Diffuse(proposal) => self.process_diffuse(packet.from, packet.data.index, proposal).await,
-                        MessageKind::Echo(proposal) => self.process_echo(packet.from, packet.data.index, proposal).await,
-                        MessageKind::Ack(proposal) => self.process_ack(packet.from, packet.data.index, proposal).await,
-                        MessageKind::Lock => self.process_lock(packet.from, packet.data.index).await,
-                        MessageKind::LockReply(locked_state) => self.process_lock_reply(packet.from, packet.data.index, locked_state).await
+                    match packet.data {
+                        MessageKind::Diffuse(diffuse) => self.process_diffuse(packet.from, diffuse).await,
+                        MessageKind::Echo(echo) => self.process_echo(packet.from, echo).await,
+                        MessageKind::Ack(ack) => self.process_ack(packet.from, ack).await,
+                        MessageKind::Lock(lock) => self.process_lock(packet.from, lock).await,
+                        MessageKind::LockReply(lock_reply) => self.process_lock_reply(packet.from, lock_reply).await
                     };
                 }
                 _ = self.cancellation_token.cancelled() => {
@@ -552,79 +569,80 @@ impl Croissus {
         }
     }
 
-    async fn process_diffuse(&self, from: NodeId, index: usize, proposal: Proposal) {
+    async fn process_diffuse(&self, from: NodeId, diffuse: DiffuseMessage) {
         debug!(
             "Node {} received diffuse {:?} from {}",
-            self.network.node, proposal, from
+            self.network.node, diffuse, from
         );
         let mut state = self.state.lock().await;
 
-        let diffuse_result = state.process_diffuse(index, proposal.clone());
+        let diffuse_result = state.process_diffuse(diffuse.index, diffuse.proposal.clone());
         if let Err(error) = diffuse_result {
             debug!("{error}");
             return; // TODO: Return negative ack
         }
 
-        for sibling in &proposal.flow.echo_to[&self.network.node] {
+        for sibling in &diffuse.proposal.flow.echo_to[&self.network.node] {
             debug!(
                 "Node {} sending echo {:?} to sibling {}",
-                self.network.node, proposal, sibling
+                self.network.node, diffuse.proposal, sibling
             );
             self.network
                 .send(
                     *sibling,
-                    Message {
-                        index,
-                        kind: MessageKind::Echo(proposal.clone()),
-                    },
+                    MessageKind::Echo(EchoMessage {
+                        index: diffuse.index,
+                        proposal: diffuse.proposal.clone(),
+                    }),
                 )
                 .await
                 .unwrap();
         }
 
-        self.diffuse_proposal(index, proposal.clone()).await;
+        self.diffuse_proposal(diffuse.index, diffuse.proposal.clone())
+            .await;
 
-        if let Some((destination, message)) = state.try_ack(index, proposal) {
+        if let Some((destination, message)) = state.try_ack(diffuse.index, diffuse.proposal) {
             debug!("Node {} sending ack to {}", self.network.node, destination);
             self.network.send(destination, message).await.unwrap()
         }
     }
 
-    async fn process_echo(&self, from: NodeId, index: usize, proposal: Proposal) {
+    async fn process_echo(&self, from: NodeId, echo: EchoMessage) {
         debug!(
             "Node {} received echo {:?} from {}",
-            self.network.node, proposal, from
+            self.network.node, echo, from
         );
         let mut state = self.state.lock().await;
 
         // TODO: Is it possible for 2 proposal's from different nodes to have the same echo?
-        if let Some((destination, message)) = state.process_echo(from, index, proposal) {
+        if let Some((destination, message)) = state.process_echo(from, echo.index, echo.proposal) {
             debug!("Node {} sending ack to {}", self.network.node, destination);
             self.network.send(destination, message).await.unwrap()
         }
     }
 
-    async fn process_ack(&self, from: NodeId, index: usize, proposal: Proposal) {
+    async fn process_ack(&self, from: NodeId, ack: AckMessage) {
         debug!(
             "Node {} received ack {:?} from {}",
-            self.network.node, proposal, from
+            self.network.node, ack, from
         );
         let mut state = self.state.lock().await;
-        if index >= state.log.len() {
+        if ack.index >= state.log.len() {
             // TODO: Most likely not needed, since an ack has to come after we set proposal (as a response to diffuse)
-            state.set_log(index, ProposalSlot::None);
+            state.set_log(ack.index, ProposalSlot::None);
         }
 
-        state.log[index].as_mut().unwrap().acks.insert(from);
+        state.log[ack.index].as_mut().unwrap().acks.insert(from);
 
-        if self.network.node == proposal.proposer {
+        if self.network.node == ack.proposal.proposer {
             // If the ack was delayed, ignore it
-            if state.current_index != index {
+            if state.current_index != ack.index {
                 return;
             }
 
-            if state.can_ack(index) {
-                state.log[index].as_mut().unwrap().done = true;
+            if state.can_ack(ack.index) {
+                state.log[ack.index].as_mut().unwrap().done = true;
                 match state.finish_adopt_commit_phase.take() {
                     None => {
                         error!(
@@ -639,16 +657,19 @@ impl Croissus {
                     }
                 };
             }
-        } else if let Some((destination, message)) = state.try_ack(index, proposal) {
+        } else if let Some((destination, message)) = state.try_ack(ack.index, ack.proposal) {
             debug!("Node {} sending ack to {}", self.network.node, destination);
             self.network.send(destination, message).await.unwrap()
         }
     }
 
-    async fn process_lock(&self, from: NodeId, index: usize) {
-        debug!("Node {} received lock from {}", self.network.node, from);
+    async fn process_lock(&self, from: NodeId, lock: LockMessage) {
+        debug!(
+            "Node {} received lock {:?} from {}",
+            self.network.node, lock, from
+        );
         let mut state = self.state.lock().await;
-        let locked_state = state.lock(index);
+        let locked_state = state.lock(lock.index);
 
         debug!(
             "Node {} sending lock reply {:?} to {}",
@@ -657,25 +678,25 @@ impl Croissus {
         self.network
             .send(
                 from,
-                Message {
-                    index,
-                    kind: MessageKind::LockReply(locked_state),
-                },
+                MessageKind::LockReply(LockReplyMessage {
+                    index: lock.index,
+                    locked_state,
+                }),
             )
             .await
             .unwrap()
     }
 
-    async fn process_lock_reply(&self, from: NodeId, index: usize, locked_state: LockedState) {
+    async fn process_lock_reply(&self, from: NodeId, lock_reply: LockReplyMessage) {
         debug!(
             "Node {} received lock reply {:?} from {}",
-            self.network.node, locked_state, from
+            self.network.node, lock_reply, from
         );
         let mut state = self.state.lock().await;
-        if state.current_index != index {
+        if state.current_index != lock_reply.index {
             return;
         }
-        state.process_lock_reply(from, locked_state);
+        state.process_lock_reply(from, lock_reply.locked_state);
     }
 
     pub async fn get_log(&self) -> Vec<Option<LockedState>> {
@@ -691,14 +712,22 @@ mod tests {
     use futures::future::TryJoinAll;
     use std::collections::HashMap;
     use std::env::set_var;
+    use std::sync::Once;
     use std::time::Duration;
+
+    static INIT_LOGGER: Once = Once::new();
+    fn init_logger() {
+        INIT_LOGGER.call_once(|| {
+            unsafe {
+                set_var("RUST_LOG", "TRACE");
+            }
+            pretty_env_logger::init_timed();
+        });
+    }
 
     #[tokio::test]
     async fn test_croissus_synchronous() {
-        unsafe {
-            set_var("RUST_LOG", "TRACE");
-        }
-        pretty_env_logger::init_timed();
+        init_logger();
         let nodes = (0..9).into_iter().collect::<Vec<_>>();
         let (mut virtual_networks, mut receivers) = create_channel_network(nodes.clone());
 
@@ -769,10 +798,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_croissus_concurrent() {
-        unsafe {
-            set_var("RUST_LOG", "TRACE");
-        }
-        pretty_env_logger::init_timed();
+        init_logger();
         let nodes = (0..9).into_iter().collect::<Vec<_>>();
         let (mut virtual_networks, mut receivers) = create_channel_network(nodes.clone());
 
