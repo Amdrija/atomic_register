@@ -16,6 +16,7 @@ use tokio::select;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot::Sender;
 use tokio::sync::{oneshot, Mutex};
+use tokio::sync::oneshot::error::RecvError;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -110,22 +111,20 @@ impl Croissus {
         (index, Err(anyhow!("Node couldn't commit, it must adopt")))
     }
     async fn get_safe_value(&self) -> Option<Command> {
-        let (index, lock_phase_finished) = {
+        let (packets, lock_phase_finished) = {
             let mut state = self.state.lock().await;
             state.go_to_lock_phase()
         };
 
-        self.network
-            .broadcast(MessageKind::Lock(LockMessage { index }))
-            .await
-            .unwrap();
+        self.network.send_packets(packets).await;
 
-        let result = lock_phase_finished.await;
-        if let Err(error) = result {
-            error!("Node {} failed to finish lock phase, sender part of channel - finish_lock_phase dropped. Error: {}", self.network.node, error);
-            panic!("{error}");
+        match lock_phase_finished.await {
+            Ok(command) => command,
+            Err(error) => {
+                error!("Node {} failed to finish lock phase, sender part of channel - finish_lock_phase dropped. Error: {}", self.network.node, error);
+                panic!("{error}");
+            }
         }
-        result.unwrap()
     }
 
     async fn receive_loop(&self, mut recv_channel: Receiver<Packet<MessageKind>>) {

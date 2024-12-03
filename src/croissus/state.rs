@@ -2,7 +2,7 @@ use crate::command::Command;
 use crate::core;
 use crate::core::{NodeId, Packet};
 use crate::croissus::flow::Flow;
-use crate::croissus::messages::{AckMessage, DiffuseMessage, EchoMessage, MessageKind};
+use crate::croissus::messages::{AckMessage, DiffuseMessage, EchoMessage, LockMessage, MessageKind};
 use anyhow::bail;
 use log::{debug, error};
 use rkyv::{Archive, Deserialize, Serialize};
@@ -296,12 +296,12 @@ impl CroissusState {
             .unwrap_or(self.log.len())
     }
 
-    pub fn go_to_lock_phase(&mut self) -> (usize, oneshot::Receiver<Option<Command>>) {
+    pub fn go_to_lock_phase(&mut self) -> (Vec<Packet<MessageKind>>, oneshot::Receiver<Option<Command>>) {
         let (finish_lock_phase, lock_phase_finished) = oneshot::channel();
         self.finish_lock_phase.replace(finish_lock_phase);
         self.fetched_states.clear();
 
-        (self.current_index, lock_phase_finished)
+        (core::make_broadcast_packets(self.node, &self.nodes, MessageKind::Lock(LockMessage{ index: self.current_index })), lock_phase_finished)
     }
 
     pub fn process_echo(
