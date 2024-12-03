@@ -207,13 +207,14 @@ impl Croissus {
 #[cfg(test)]
 mod tests {
     use crate::command::{Command, CommandKind, WriteCommand};
-    use crate::core::create_channel_network;
+    use crate::core::{create_channel_network, NodeId};
     use crate::croissus::{Croissus, CroissusResult};
     use futures::future::TryJoinAll;
     use std::collections::HashMap;
     use std::env::set_var;
-    use std::sync::Once;
+    use std::sync::{Arc, Once};
     use std::time::Duration;
+    use tokio::task::JoinHandle;
 
     static INIT_LOGGER: Once = Once::new();
     fn init_logger() {
@@ -225,27 +226,62 @@ mod tests {
         });
     }
 
-    #[tokio::test]
-    async fn test_croissus_synchronous() {
+    fn init_test(
+        nodes: &Vec<NodeId>,
+    ) -> (HashMap<NodeId, Arc<Croissus>>, TryJoinAll<JoinHandle<()>>) {
         init_logger();
-        let nodes = (0..9).into_iter().collect::<Vec<_>>();
         let (mut virtual_networks, mut receivers) = create_channel_network(nodes.clone());
 
         let mut croissuses = HashMap::new();
         let mut spawned_tasks = Vec::new();
-        for node in &nodes {
+        for node in nodes {
             let network = virtual_networks.remove(node).unwrap();
             let receive_channel = receivers.remove(node).unwrap();
             let (croissus, join_handle) = Croissus::new(
                 network,
                 nodes.clone(),
-                Duration::from_millis(100),
+                Duration::from_millis(10),
                 receive_channel,
             );
             croissuses.insert(node.clone(), croissus);
             spawned_tasks.push(join_handle);
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        (
+            croissuses,
+            spawned_tasks.into_iter().collect::<TryJoinAll<_>>(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_running_alone() {
+        let nodes = (0..9).into_iter().collect::<Vec<_>>();
+        let (mut croissuses, spawned_tasks) = init_test(&nodes);
+
+        let proposed_command = Command {
+            id: 0,
+            client_id: 0,
+            command_kind: CommandKind::Write(WriteCommand { key: 10, value: 11 }),
+        };
+        let (index, croissus_result) = croissuses[&0].propose(proposed_command.clone()).await;
+
+        assert_eq!(index, 1);
+        match croissus_result {
+            CroissusResult::Committed(command) => assert_eq!(proposed_command, command),
+            CroissusResult::Adopted(_) => assert!(false),
+        }
+
+        // Cleanup
+        for (_, croissus) in croissuses.drain() {
+            croissus.quit();
+        }
+        spawned_tasks.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_croissus_synchronous() {
+        let nodes = (0..9).into_iter().collect::<Vec<_>>();
+        let (mut croissuses, spawned_tasks) = init_test(&nodes);
 
         let mut adopt_commit_log = HashMap::new();
         for proposer in &nodes {
@@ -263,65 +299,27 @@ mod tests {
                 .entry(index)
                 .or_insert(Vec::new())
                 .push(croissus_result);
-
-            for other in nodes.iter().filter(|node| *node != proposer) {
-                let (index, croissus_result) = croissuses[other]
-                    .propose(Command {
-                        id: *other as u64,
-                        client_id: *other as u64,
-                        command_kind: CommandKind::Write(WriteCommand {
-                            key: *other as u64,
-                            value: 10 + *other as u32,
-                        }),
-                    })
-                    .await;
-                adopt_commit_log
-                    .entry(index)
-                    .or_insert(Vec::new())
-                    .push(croissus_result);
-            }
         }
 
         assert!(adopt_commit_log.values().all(|results| is_valid(results)));
 
+        // Cleanup
         for (_, croissus) in croissuses.drain() {
             croissus.quit();
         }
-
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        spawned_tasks
-            .into_iter()
-            .collect::<TryJoinAll<_>>()
-            .await
-            .unwrap();
+        spawned_tasks.await.unwrap();
     }
 
     #[tokio::test]
     async fn test_croissus_concurrent() {
-        init_logger();
         let nodes = (0..9).into_iter().collect::<Vec<_>>();
-        let (mut virtual_networks, mut receivers) = create_channel_network(nodes.clone());
-
-        let mut croissuses = HashMap::new();
-        let mut spawned_tasks = Vec::new();
-        for node in &nodes {
-            let network = virtual_networks.remove(node).unwrap();
-            let receive_channel = receivers.remove(node).unwrap();
-            let (croissus, join_handle) = Croissus::new(
-                network,
-                nodes.clone(),
-                Duration::from_millis(100),
-                receive_channel,
-            );
-            croissuses.insert(node.clone(), croissus);
-            spawned_tasks.push(join_handle);
-        }
+        let (mut croissuses, spawned_tasks) = init_test(&nodes);
 
         let c4 = croissuses.remove(&2).unwrap();
         let c3 = croissuses.remove(&5).unwrap();
         let c3_clone = c3.clone();
         let c4_clone = c4.clone();
-        let f1 = tokio::spawn(async move {
+        let c4_propose_task = tokio::spawn(async move {
             c4_clone
                 .propose(Command {
                     id: 1,
@@ -330,7 +328,7 @@ mod tests {
                 })
                 .await
         });
-        let f2 = tokio::spawn(async move {
+        let c3_propose_task = tokio::spawn(async move {
             c3_clone
                 .propose(Command {
                     id: 2,
@@ -343,31 +341,27 @@ mod tests {
                 .await
         });
 
-        let result1 = f1.await;
-        assert!(result1.is_ok());
-        let (index1, result1) = result1.unwrap();
+        let c4_result = c4_propose_task.await;
+        assert!(c4_result.is_ok());
+        let (c4_index, c4_croissus_result) = c4_result.unwrap();
 
-        let result2 = f2.await;
-        assert!(result2.is_ok());
-        let (index2, result2) = result2.unwrap();
-        if index1 == index2 {
-            assert!(is_valid(&vec![result1, result2]));
+        let c3_result = c3_propose_task.await;
+        assert!(c3_result.is_ok());
+        let (c3_index, c3_croissus_result) = c3_result.unwrap();
+        if c4_index == c3_index {
+            assert!(is_valid(&vec![c4_croissus_result, c3_croissus_result]));
         } else {
-            assert!(result1.is_committed());
-            assert!(result2.is_committed());
+            assert!(c4_croissus_result.is_committed());
+            assert!(c3_croissus_result.is_committed());
         }
 
+        // Cleanup
         c3.quit();
         c4.quit();
         for (_, croissus) in croissuses.drain() {
             croissus.quit();
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        spawned_tasks
-            .into_iter()
-            .collect::<TryJoinAll<_>>()
-            .await
-            .unwrap();
+        spawned_tasks.await.unwrap();
     }
 
     fn is_valid(results: &Vec<CroissusResult>) -> bool {
