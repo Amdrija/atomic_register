@@ -4,6 +4,7 @@ use crate::croissus::flow::Flow;
 use crate::croissus::messages::{
     AckMessage, DiffuseMessage, EchoMessage, LockMessage, LockReplyMessage, MessageKind,
 };
+use crate::croissus::state::{CroissusResult, CroissusState, LockedState, Proposal, ProposalSlot};
 use anyhow::{anyhow, bail, Result};
 use log::{debug, error, info};
 use rkyv::{Archive, Deserialize, Serialize};
@@ -20,362 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 pub mod flow;
 mod messages;
-
-#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
-struct Proposal {
-    command: Command,
-    proposer: NodeId,
-    flow: Flow,
-}
-
-#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
-enum ProposalSlot {
-    None,
-    Tombstone,
-    Proposal(Proposal),
-}
-
-#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
-struct LockedState {
-    proposal_slot: ProposalSlot,
-    echoes: HashMap<NodeId, HashSet<NodeId>>,
-    acks: HashSet<NodeId>,
-    done: bool,
-}
-
-impl LockedState {
-    fn new(proposal_slot: ProposalSlot) -> Self {
-        Self {
-            proposal_slot,
-            echoes: HashMap::new(),
-            acks: HashSet::new(),
-            done: false,
-        }
-    }
-}
-
-#[derive(Debug)]
-enum CroissusResult {
-    Committed(Command),
-    Adopted(Option<Command>),
-}
-
-impl CroissusResult {
-    fn is_committed(&self) -> bool {
-        match self {
-            CroissusResult::Committed(_) => true,
-            _ => false,
-        }
-    }
-
-    fn is_adopted(&self) -> bool {
-        match self {
-            CroissusResult::Adopted(_) => true,
-            _ => false,
-        }
-    }
-}
-
-struct CroissusState {
-    node: NodeId,
-    node_flow: Flow,
-    majority_threshold: usize,
-    log: Vec<Option<LockedState>>,
-    current_index: usize,
-    finish_adopt_commit_phase: Option<Sender<()>>,
-    finish_lock_phase: Option<Sender<Option<Command>>>,
-    fetched_states: HashMap<NodeId, LockedState>,
-}
-
-impl CroissusState {
-    fn new(node: NodeId, node_flow: Flow, nodes: usize) -> Self {
-        CroissusState {
-            node,
-            node_flow,
-            majority_threshold: nodes / 2 + 1,
-            log: vec![Some(LockedState::new(ProposalSlot::Tombstone))],
-            current_index: 0,
-            finish_adopt_commit_phase: None,
-            finish_lock_phase: None,
-            fetched_states: HashMap::new(),
-        }
-    }
-
-    fn can_ack(&self, index: usize) -> bool {
-        if index >= self.log.len() {
-            // The log currently doesn't have anything at the index, so there's nothing to ack
-            // Shouldn't be possible to trigger with the way algorithm works
-            return false;
-        }
-
-        match &self.log[index] {
-            None => false, // If nothing at index then nothing that can be acked
-            Some(locked_state) => {
-                if locked_state.done {
-                    return false;
-                }
-
-                match &locked_state.proposal_slot {
-                    ProposalSlot::None | ProposalSlot::Tombstone => false, //TODO: You cannot ack if you've got a TOMBSTONE
-                    ProposalSlot::Proposal(proposal) => {
-                        // The variable should_have_echoed from the pseudocode is a set of nodes which
-                        // should echo the current node. Since echoes are symmetrical, we can just use
-                        // the set of nodes that the current node echoes. Then, this set of nodes needs to
-                        // be a subset of the echoes the node has received for the proposal's proposer.
-                        // (Only 1 proposal can be sent by a proposer at a certain slot)
-                        if !proposal.flow.echo_to[&self.node]
-                            .difference(
-                                &locked_state
-                                    .echoes
-                                    .get(&proposal.proposer)
-                                    .cloned()
-                                    .unwrap_or_default(),
-                            )
-                            .next()
-                            .is_none()
-                        {
-                            return false;
-                        }
-
-                        // All nodes which the current node forwards the proposal must ack
-                        // before the current node can ack.
-                        if !proposal.flow.diffuse_to[&self.node]
-                            .difference(&locked_state.acks)
-                            .next()
-                            .is_none()
-                        {
-                            return false;
-                        }
-
-                        true
-                    }
-                }
-            }
-        }
-    }
-
-    fn locked(&self, index: usize) -> bool {
-        if index >= self.log.len() {
-            return false;
-        }
-
-        match &self.log[index] {
-            None => false,
-            Some(locked_state) => match locked_state.proposal_slot {
-                ProposalSlot::None => false,
-                ProposalSlot::Tombstone | ProposalSlot::Proposal(_) => true,
-            },
-        }
-    }
-
-    fn lock(&mut self, index: usize) -> LockedState {
-        if !self.locked(index) {
-            self.set_log(index, ProposalSlot::Tombstone);
-        }
-
-        match &self.log[index] {
-            None => {
-                error!(
-                    "Node {} tried to lock index {} with empty slot",
-                    self.node, index
-                );
-                panic!(
-                    "Node {} tried to lock index {} with empty slot",
-                    self.node, index
-                );
-            }
-            Some(locked_state) => locked_state.clone(),
-        }
-    }
-
-    fn set_log(&mut self, index: usize, proposal_slot: ProposalSlot) {
-        if index >= self.log.len() {
-            self.log.resize(index + 1, None);
-        }
-        self.log[index] = Some(LockedState::new(proposal_slot));
-    }
-
-    fn propose(&mut self, command: Command) -> (Proposal, usize, oneshot::Receiver<()>) {
-        let proposal = Proposal {
-            command,
-            proposer: self.node,
-            flow: self.node_flow.clone(),
-        };
-
-        self.current_index = self.first_unlocked_index();
-        // TODO: It is possible that a slot for which the node receives an echo is overridden
-        // However, this shouldn't impact the algorithm, as the echoed proposal will never be
-        // echoed by this node (because it sets another proposal here, so it is locked). Therefore,
-        // the node's sibling will never ack, so the sibling's echoed proposal will never
-        // be committed. I think that also this proposal will never be committed as well.
-        self.set_log(self.current_index, ProposalSlot::Proposal(proposal.clone()));
-
-        let (send, recv) = oneshot::channel();
-        self.finish_adopt_commit_phase.replace(send);
-
-        (proposal, self.current_index, recv)
-    }
-
-    fn first_unlocked_index(&self) -> usize {
-        // Basically, it is possible to have a slot here which doesn't have a proposal,
-        // but it has received an echo from a sibling
-        (0..self.log.len())
-            .find(|index| !self.locked(*index))
-            .unwrap_or(self.log.len())
-    }
-
-    fn go_to_lock_phase(&mut self) -> (usize, oneshot::Receiver<Option<Command>>) {
-        let (finish_lock_phase, lock_phase_finished) = oneshot::channel();
-        self.finish_lock_phase.replace(finish_lock_phase);
-        self.fetched_states.clear();
-
-        (self.current_index, lock_phase_finished)
-    }
-
-    fn process_diffuse(&mut self, index: usize, proposal: Proposal) -> Result<()> {
-        if self.locked(index) {
-            bail!("Node {} is locked, aborting diffuse", self.node); // TODO: Send NACK optimization
-        }
-
-        // TODO: It is possible that a slot for which the node receives an echo is overridden
-        // However, this shouldn't impact the algorithm, as the echoed proposal will never be
-        // echoed by this node (because it sets another proposal here, so it is locked). Therefore,
-        // the node's sibling will never ack, so the sibling's echoed proposal will never
-        // be committed. I think that also this proposal will never be committed as well.
-        self.set_log(index, ProposalSlot::Proposal(proposal));
-
-        Ok(())
-    }
-
-    fn process_echo(
-        &mut self,
-        from: NodeId,
-        index: usize,
-        proposal: Proposal,
-    ) -> Option<(NodeId, MessageKind)> {
-        if index >= self.log.len() {
-            self.set_log(index, ProposalSlot::None);
-        }
-
-        let echoes = self.log[index]
-            .as_mut()
-            .unwrap()
-            .echoes
-            .entry(proposal.proposer)
-            .or_default();
-        echoes.insert(from);
-        self.try_ack(index, proposal)
-    }
-
-    fn try_ack(&mut self, index: usize, proposal: Proposal) -> Option<(NodeId, MessageKind)> {
-        if self.can_ack(index) {
-            self.log[index].as_mut().unwrap().done = true;
-            let predecessor = proposal
-                .flow
-                .diffuse_to
-                .iter()
-                .find(|(_, diffuses_to)| diffuses_to.contains(&self.node))
-                .map(|(predecessor, _)| *predecessor);
-            return predecessor.map(|predecessor| {
-                (
-                    predecessor,
-                    MessageKind::Ack(AckMessage { index, proposal }),
-                )
-            });
-        }
-
-        None
-    }
-
-    fn process_lock_reply(&mut self, from: NodeId, locked_state: LockedState) {
-        self.fetched_states.insert(from, locked_state);
-
-        if self.fetched_states.len() == self.majority_threshold {
-            let (deduced_count, fetched_count, mut proposed_commands) = self.deduce();
-
-            let mut command = None;
-            for (proposer, fetched) in fetched_count {
-                if fetched + deduced_count.get(&proposer).cloned().unwrap_or_default()
-                    >= self.majority_threshold
-                {
-                    command = proposed_commands.remove(&proposer);
-                    break;
-                }
-            }
-
-            if command.is_none() {
-                for (proposer, deduced) in deduced_count {
-                    if deduced >= self.majority_threshold / 2 {
-                        command = proposed_commands.remove(&proposer);
-                        break;
-                    }
-                }
-            }
-
-            match self.finish_lock_phase.take() {
-                None => {
-                    error!("The finish_lock_phase channel must have been set beforehand.");
-                }
-                Some(finish_lock) => finish_lock.send(command).unwrap(),
-            }
-        }
-    }
-
-    fn deduce(
-        &self,
-    ) -> (
-        HashMap<NodeId, usize>,
-        HashMap<NodeId, usize>,
-        HashMap<NodeId, Command>,
-    ) {
-        let mut known = self.fetched_states.keys().cloned().collect::<HashSet<_>>();
-        let mut fetched_count = HashMap::new();
-        let mut deduced_count = HashMap::new();
-        let mut proposed_commands = HashMap::new();
-
-        for (node, state) in &self.fetched_states {
-            match &state.proposal_slot {
-                ProposalSlot::None => {
-                    error!(
-                        "Node {} fetched {:?} from {}",
-                        self.node, state.proposal_slot, node
-                    );
-                    panic!(
-                        "Node {} responded to Lock message with {:?}",
-                        node,
-                        ProposalSlot::None
-                    );
-                    //TODO: A nice way would be to have a different enum here, but that's just
-                    // more boilerplate
-                }
-                ProposalSlot::Tombstone => {
-                    continue;
-                }
-                ProposalSlot::Proposal(proposal) => {
-                    if let Vacant(entry) = proposed_commands.entry(proposal.proposer) {
-                        entry.insert(proposal.command.clone());
-                    }
-
-                    let entry = fetched_count.entry(proposal.proposer).or_default();
-                    *entry += 1;
-                    if !state.done {
-                        continue;
-                    }
-
-                    for node_adopted in proposal.flow.adoptions_given_acked(*node) {
-                        if !known.contains(&node_adopted) {
-                            known.insert(node_adopted);
-                            let entry = deduced_count.entry(proposal.proposer).or_default();
-                            *entry += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        (deduced_count, fetched_count, proposed_commands)
-    }
-}
+mod state;
 
 struct Croissus {
     network: VirtualNetwork<MessageKind>,
@@ -397,8 +43,8 @@ impl Croissus {
             network,
             state: Arc::new(Mutex::new(CroissusState::new(
                 node,
+                nodes.clone(),
                 Flow::ring(nodes.clone(), node),
-                nodes.len(),
             ))),
             timeout: rtt,
             cancellation_token: CancellationToken::new(),
@@ -436,7 +82,7 @@ impl Croissus {
     }
 
     async fn try_commit(&self, command: Command) -> (usize, Result<()>) {
-        let (proposal, index, finished_propose) = {
+        let (packets, index, finished_propose) = {
             let mut state = self.state.lock().await;
             // Don't have to check if the slot is locked, since the propose will
             // automatically pick the next unlocked slot
@@ -445,7 +91,8 @@ impl Croissus {
 
         let timeout = tokio::time::sleep(self.timeout);
 
-        self.diffuse_proposal(index, proposal).await;
+        self.network.send_packets(packets).await;
+
         select! {
             _ = timeout => {
                 debug!("Node {} ack timeout elapsed", self.network.node);
@@ -455,40 +102,13 @@ impl Croissus {
 
         {
             let state = self.state.lock().await;
-            if state
-                .log
-                .get(state.current_index)
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .done
-            {
+            if state.is_propose_committed() {
                 return (index, Ok(()));
             }
         }
 
         (index, Err(anyhow!("Node couldn't commit, it must adopt")))
     }
-
-    async fn diffuse_proposal(&self, index: usize, proposal: Proposal) {
-        for destination in &proposal.flow.diffuse_to[&self.network.node] {
-            debug!(
-                "Node {} sending diffuse {:?} to {}",
-                self.network.node, proposal, destination
-            );
-            self.network
-                .send(
-                    *destination,
-                    MessageKind::Diffuse(DiffuseMessage {
-                        index,
-                        proposal: proposal.clone(),
-                    }),
-                )
-                .await
-                .unwrap()
-        }
-    }
-
     async fn get_safe_value(&self) -> Option<Command> {
         let (index, lock_phase_finished) = {
             let mut state = self.state.lock().await;
@@ -542,36 +162,8 @@ impl Croissus {
         );
         let mut state = self.state.lock().await;
 
-        let diffuse_result = state.process_diffuse(diffuse.index, diffuse.proposal.clone());
-        if let Err(error) = diffuse_result {
-            debug!("{error}");
-            return; // TODO: Return negative ack
-        }
-
-        for sibling in &diffuse.proposal.flow.echo_to[&self.network.node] {
-            debug!(
-                "Node {} sending echo {:?} to sibling {}",
-                self.network.node, diffuse.proposal, sibling
-            );
-            self.network
-                .send(
-                    *sibling,
-                    MessageKind::Echo(EchoMessage {
-                        index: diffuse.index,
-                        proposal: diffuse.proposal.clone(),
-                    }),
-                )
-                .await
-                .unwrap();
-        }
-
-        self.diffuse_proposal(diffuse.index, diffuse.proposal.clone())
-            .await;
-
-        if let Some((destination, message)) = state.try_ack(diffuse.index, diffuse.proposal) {
-            debug!("Node {} sending ack to {}", self.network.node, destination);
-            self.network.send(destination, message).await.unwrap()
-        }
+        let packets = state.process_diffuse(diffuse);
+        self.network.send_packets(packets).await;
     }
 
     async fn process_echo(&self, from: NodeId, echo: EchoMessage) {

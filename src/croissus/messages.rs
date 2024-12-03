@@ -1,4 +1,4 @@
-use crate::croissus::{LockedState, Proposal};
+use crate::croissus::state::{LockedState, Proposal};
 use rkyv::{Archive, Deserialize, Serialize};
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]

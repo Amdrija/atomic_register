@@ -139,6 +139,20 @@ where
     (virtual_networks, recv_channels)
 }
 
+pub fn make_broadcast_packets<T>(from: NodeId, nodes: &[NodeId], message: T) -> Vec<Packet<T>>
+where
+    T: Clone + Debug,
+{
+    nodes
+        .iter()
+        .map(|to| Packet {
+            from,
+            to: *to,
+            data: message.clone(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod test {
     use crate::core::{create_channel_network, NodeId, VirtualNetwork};
