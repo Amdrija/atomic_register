@@ -413,8 +413,12 @@ impl CroissusState {
         }]
     }
 
-    pub fn process_lock_reply(&mut self, from: NodeId, locked_state: LockedState) {
-        self.fetched_states.insert(from, locked_state);
+    pub fn process_lock_reply(&mut self, from: NodeId, lock_reply: LockReplyMessage) {
+        if self.current_index != lock_reply.index {
+            return;
+        }
+
+        self.fetched_states.insert(from, lock_reply.locked_state);
 
         if self.fetched_states.len() == self.majority_threshold {
             let (deduced_count, fetched_count, mut proposed_commands) = self.deduce();

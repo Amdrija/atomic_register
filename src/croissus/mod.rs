@@ -201,10 +201,7 @@ impl Croissus {
             self.network.node, lock_reply, from
         );
         let mut state = self.state.lock().await;
-        if state.current_index != lock_reply.index {
-            return;
-        }
-        state.process_lock_reply(from, lock_reply.locked_state);
+        state.process_lock_reply(from, lock_reply);
     }
 
     pub async fn get_log(&self) -> Vec<Option<LockedState>> {
