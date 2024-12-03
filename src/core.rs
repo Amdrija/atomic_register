@@ -67,6 +67,22 @@ where
         Ok(())
     }
 
+    pub async fn send_packets(&self, packets: Vec<Packet<T>>) {
+        for packet in packets {
+            let destination = packet.to;
+            let result = self.senders[&packet.to].send(packet).await;
+            if let Err(error) = result {
+                // Unfortunately, this error has to be swallowed, as calling unwrap will panic
+                // the calling thread, which can possibly be the main thread or the thread responsible
+                // for receiving messages, therefore, effectively killing the node (as it will not
+                // be able to respond to any messages). This idea with channels wasn't so good :(
+                // Best way to crash the nodes is to set up the link to drop packets instead of
+                // actually crashing them.
+                error!("Removing {} from network because the recv part of the channel is closed, likely due to closed connection, error: {}", destination, error);
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.senders.len()
     }

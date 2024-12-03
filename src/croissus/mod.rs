@@ -1,6 +1,9 @@
 use crate::command::Command;
 use crate::core::{NodeId, Packet, VirtualNetwork};
 use crate::croissus::flow::Flow;
+use crate::croissus::messages::{
+    AckMessage, DiffuseMessage, EchoMessage, LockMessage, LockReplyMessage, MessageKind,
+};
 use anyhow::{anyhow, bail, Result};
 use log::{debug, error, info};
 use rkyv::{Archive, Deserialize, Serialize};
@@ -16,6 +19,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 pub mod flow;
+mod messages;
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 struct Proposal {
@@ -48,44 +52,6 @@ impl LockedState {
             done: false,
         }
     }
-}
-
-#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
-struct DiffuseMessage {
-    index: usize,
-    proposal: Proposal,
-}
-
-#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
-struct EchoMessage {
-    index: usize,
-    proposal: Proposal,
-}
-
-#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
-struct AckMessage {
-    index: usize,
-    proposal: Proposal,
-}
-
-#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
-struct LockMessage {
-    index: usize,
-}
-
-#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
-struct LockReplyMessage {
-    index: usize,
-    locked_state: LockedState,
-}
-
-#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
-enum MessageKind {
-    Diffuse(DiffuseMessage),
-    Echo(EchoMessage),
-    Ack(AckMessage), // Does an ack need to be identified?
-    Lock(LockMessage),
-    LockReply(LockReplyMessage),
 }
 
 #[derive(Debug)]
