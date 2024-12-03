@@ -307,21 +307,30 @@ impl CroissusState {
     pub fn process_echo(
         &mut self,
         from: NodeId,
-        index: usize,
-        proposal: Proposal,
-    ) -> Option<(NodeId, MessageKind)> {
-        if index >= self.log.len() {
-            self.set_log(index, ProposalSlot::None);
+        echo: EchoMessage,
+    ) -> Vec<Packet<MessageKind>> {
+        if echo.index >= self.log.len() {
+            self.set_log(echo.index, ProposalSlot::None);
         }
 
-        let echoes = self.log[index]
+        let echoes = self.log[echo.index]
             .as_mut()
             .unwrap()
             .echoes
-            .entry(proposal.proposer)
+            .entry(echo.proposal.proposer)
             .or_default();
         echoes.insert(from);
-        self.try_ack(index, proposal)
+
+        // TODO: Is it possible for 2 proposal's from different nodes to have the same echo?
+        //TODO: Refactor try_ack
+        match self.try_ack(echo.index, echo.proposal) {
+            None => Vec::new(),
+            Some((to, ack)) => vec![Packet{
+                from,
+                to,
+                data: ack,
+            }]
+        }
     }
 
     // TODO: Refactor so this also returns a vector of packets

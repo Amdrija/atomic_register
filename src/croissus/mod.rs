@@ -171,12 +171,8 @@ impl Croissus {
             self.network.node, echo, from
         );
         let mut state = self.state.lock().await;
-
-        // TODO: Is it possible for 2 proposal's from different nodes to have the same echo?
-        if let Some((destination, message)) = state.process_echo(from, echo.index, echo.proposal) {
-            debug!("Node {} sending ack to {}", self.network.node, destination);
-            self.network.send(destination, message).await.unwrap()
-        }
+        let packets = state.process_echo(from, echo);
+        self.network.send_packets(packets).await;
     }
 
     async fn process_ack(&self, from: NodeId, ack: AckMessage) {
