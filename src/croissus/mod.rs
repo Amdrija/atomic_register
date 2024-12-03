@@ -191,22 +191,8 @@ impl Croissus {
             self.network.node, lock, from
         );
         let mut state = self.state.lock().await;
-        let locked_state = state.lock(lock.index);
-
-        debug!(
-            "Node {} sending lock reply {:?} to {}",
-            self.network.node, locked_state, from
-        );
-        self.network
-            .send(
-                from,
-                MessageKind::LockReply(LockReplyMessage {
-                    index: lock.index,
-                    locked_state,
-                }),
-            )
-            .await
-            .unwrap()
+        let packets = state.process_lock(from, lock);
+        self.network.send_packets(packets).await;
     }
 
     async fn process_lock_reply(&self, from: NodeId, lock_reply: LockReplyMessage) {

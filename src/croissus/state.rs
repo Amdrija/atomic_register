@@ -2,7 +2,7 @@ use crate::command::Command;
 use crate::core;
 use crate::core::{NodeId, Packet};
 use crate::croissus::flow::Flow;
-use crate::croissus::messages::{AckMessage, DiffuseMessage, EchoMessage, LockMessage, MessageKind};
+use crate::croissus::messages::{AckMessage, DiffuseMessage, EchoMessage, LockMessage, LockReplyMessage, MessageKind};
 use anyhow::bail;
 use log::{debug, error};
 use rkyv::{Archive, Deserialize, Serialize};
@@ -326,7 +326,7 @@ impl CroissusState {
         match self.try_ack(echo.index, echo.proposal) {
             None => Vec::new(),
             Some((to, ack)) => vec![Packet{
-                from,
+                from: self.node,
                 to,
                 data: ack,
             }]
@@ -392,12 +392,25 @@ impl CroissusState {
             match self.try_ack(ack.index, ack.proposal) {
                 None => Vec::new(),
                 Some((to, ack)) => vec![Packet{
-                    from,
+                    from: self.node,
                     to,
                     data: ack,
                 }]
             }
         }
+    }
+
+    pub fn process_lock(&mut self, from: NodeId, lock: LockMessage) -> Vec<Packet<MessageKind>> {
+        let locked_state = self.lock(lock.index);
+
+        vec![Packet {
+            from: self.node,
+            to: from,
+            data: MessageKind::LockReply(LockReplyMessage {
+                index: lock.index,
+                locked_state,
+            }),
+        }]
     }
 
     pub fn process_lock_reply(&mut self, from: NodeId, locked_state: LockedState) {
