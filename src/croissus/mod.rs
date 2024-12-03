@@ -4,19 +4,14 @@ use crate::croissus::flow::Flow;
 use crate::croissus::messages::{
     AckMessage, DiffuseMessage, EchoMessage, LockMessage, LockReplyMessage, MessageKind,
 };
-use crate::croissus::state::{CroissusResult, CroissusState, LockedState, Proposal, ProposalSlot};
-use anyhow::{anyhow, bail, Result};
+use crate::croissus::state::{CroissusResult, CroissusState, LockedState};
+use anyhow::{anyhow, Result};
 use log::{debug, error, info};
-use rkyv::{Archive, Deserialize, Serialize};
-use std::collections::hash_map::Entry::Vacant;
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::select;
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::oneshot::error::RecvError;
-use tokio::sync::oneshot::Sender;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
