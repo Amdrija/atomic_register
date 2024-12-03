@@ -78,10 +78,6 @@ impl Flow {
         }
     }
 
-    // fn vec_to_set(vector: Vec<NodeId>) -> HashSet<NodeId> {
-    //     vector.into_iter().collect()
-    // }
-
     // Enumerates the replicas that have adopted a proposal if we know it was adopted by p
     pub fn adoptions_given_adopted(&self, process: NodeId) -> HashSet<NodeId> {
         let mut adopted = HashSet::new();
