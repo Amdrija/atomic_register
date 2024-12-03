@@ -181,39 +181,8 @@ impl Croissus {
             self.network.node, ack, from
         );
         let mut state = self.state.lock().await;
-        if ack.index >= state.log.len() {
-            // TODO: Most likely not needed, since an ack has to come after we set proposal (as a response to diffuse)
-            state.set_log(ack.index, ProposalSlot::None);
-        }
-
-        state.log[ack.index].as_mut().unwrap().acks.insert(from);
-
-        if self.network.node == ack.proposal.proposer {
-            // If the ack was delayed, ignore it
-            if state.current_index != ack.index {
-                return;
-            }
-
-            if state.can_ack(ack.index) {
-                state.log[ack.index].as_mut().unwrap().done = true;
-                match state.finish_adopt_commit_phase.take() {
-                    None => {
-                        error!(
-                            "Node {} never set the send part for finish_propose",
-                            self.network.node
-                        );
-                    }
-                    Some(finish_propose) => {
-                        if let Err(_) = finish_propose.send(()) {
-                            debug!("Node {} recv part of finish_propose channel close - probably due to timeout", self.network.node);
-                        }
-                    }
-                };
-            }
-        } else if let Some((destination, message)) = state.try_ack(ack.index, ack.proposal) {
-            debug!("Node {} sending ack to {}", self.network.node, destination);
-            self.network.send(destination, message).await.unwrap()
-        }
+        let packets = state.process_ack(from, ack);
+        self.network.send_packets(packets).await;
     }
 
     async fn process_lock(&self, from: NodeId, lock: LockMessage) {

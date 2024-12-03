@@ -354,6 +354,52 @@ impl CroissusState {
         None
     }
 
+    pub fn process_ack(&mut self, from: NodeId, ack: AckMessage) -> Vec<Packet<MessageKind>> {
+        if ack.index >= self.log.len() {
+            // TODO: Most likely not needed, since an ack has to come after we set proposal (as a response to diffuse)
+            self.set_log(ack.index, ProposalSlot::None);
+        }
+
+        self.log[ack.index].as_mut().unwrap().acks.insert(from);
+
+        if self.node == ack.proposal.proposer {
+            // If the ack was delayed, ignore it
+            if self.current_index != ack.index {
+                return Vec::new();
+            }
+
+            if self.can_ack(ack.index) {
+                self.log[ack.index].as_mut().unwrap().done = true;
+                match self.finish_adopt_commit_phase.take() {
+                    None => {
+                        error!(
+                            "Node {} never set the send part for finish_propose",
+                            self.node
+                        );
+                    }
+                    Some(finish_propose) => {
+                        if let Err(_) = finish_propose.send(()) {
+                            debug!("Node {} recv part of finish_propose channel close - probably due to timeout", self.node);
+                        }
+                    }
+                };
+            }
+
+            Vec::new()
+        } else {
+            // TODO: Is it possible for 2 proposal's from different nodes to have the same echo?
+            //TODO: Refactor try_ack
+            match self.try_ack(ack.index, ack.proposal) {
+                None => Vec::new(),
+                Some((to, ack)) => vec![Packet{
+                    from,
+                    to,
+                    data: ack,
+                }]
+            }
+        }
+    }
+
     pub fn process_lock_reply(&mut self, from: NodeId, locked_state: LockedState) {
         self.fetched_states.insert(from, locked_state);
 
