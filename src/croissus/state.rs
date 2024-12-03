@@ -2,7 +2,9 @@ use crate::command::Command;
 use crate::core;
 use crate::core::{NodeId, Packet};
 use crate::croissus::flow::Flow;
-use crate::croissus::messages::{AckMessage, DiffuseMessage, EchoMessage, LockMessage, LockReplyMessage, MessageKind};
+use crate::croissus::messages::{
+    AckMessage, DiffuseMessage, EchoMessage, LockMessage, LockReplyMessage, MessageKind,
+};
 use anyhow::bail;
 use log::{debug, error};
 use rkyv::{Archive, Deserialize, Serialize};
@@ -182,14 +184,7 @@ impl CroissusState {
                 }),
         );
         packets.extend(self.make_diffuse_packets(diffuse.clone()));
-
-        if let Some((destination, message)) = self.try_ack(diffuse.index, diffuse.proposal) {
-            packets.push(Packet {
-                from: self.node,
-                to: destination,
-                data: message,
-            });
-        }
+        packets.extend(self.try_ack(diffuse.index, diffuse.proposal));
 
         packets
     }
@@ -296,19 +291,26 @@ impl CroissusState {
             .unwrap_or(self.log.len())
     }
 
-    pub fn go_to_lock_phase(&mut self) -> (Vec<Packet<MessageKind>>, oneshot::Receiver<Option<Command>>) {
+    pub fn go_to_lock_phase(
+        &mut self,
+    ) -> (Vec<Packet<MessageKind>>, oneshot::Receiver<Option<Command>>) {
         let (finish_lock_phase, lock_phase_finished) = oneshot::channel();
         self.finish_lock_phase.replace(finish_lock_phase);
         self.fetched_states.clear();
 
-        (core::make_broadcast_packets(self.node, &self.nodes, MessageKind::Lock(LockMessage{ index: self.current_index })), lock_phase_finished)
+        (
+            core::make_broadcast_packets(
+                self.node,
+                &self.nodes,
+                MessageKind::Lock(LockMessage {
+                    index: self.current_index,
+                }),
+            ),
+            lock_phase_finished,
+        )
     }
 
-    pub fn process_echo(
-        &mut self,
-        from: NodeId,
-        echo: EchoMessage,
-    ) -> Vec<Packet<MessageKind>> {
+    pub fn process_echo(&mut self, from: NodeId, echo: EchoMessage) -> Vec<Packet<MessageKind>> {
         if echo.index >= self.log.len() {
             self.set_log(echo.index, ProposalSlot::None);
         }
@@ -323,35 +325,37 @@ impl CroissusState {
 
         // TODO: Is it possible for 2 proposal's from different nodes to have the same echo?
         //TODO: Refactor try_ack
-        match self.try_ack(echo.index, echo.proposal) {
-            None => Vec::new(),
-            Some((to, ack)) => vec![Packet{
-                from: self.node,
-                to,
-                data: ack,
-            }]
-        }
+        self.try_ack(echo.index, echo.proposal)
     }
 
     // TODO: Refactor so this also returns a vector of packets
-    pub fn try_ack(&mut self, index: usize, proposal: Proposal) -> Option<(NodeId, MessageKind)> {
+    pub fn try_ack(&mut self, index: usize, proposal: Proposal) -> Vec<Packet<MessageKind>> {
         if self.can_ack(index) {
-            self.log[index].as_mut().unwrap().done = true;
-            let predecessor = proposal
-                .flow
-                .diffuse_to
-                .iter()
-                .find(|(_, diffuses_to)| diffuses_to.contains(&self.node))
-                .map(|(predecessor, _)| *predecessor);
-            return predecessor.map(|predecessor| {
-                (
-                    predecessor,
-                    MessageKind::Ack(AckMessage { index, proposal }),
-                )
-            });
+            return self.ack(index, proposal);
         }
 
-        None
+        Vec::new()
+    }
+
+    fn ack(&mut self, index: usize, proposal: Proposal) -> Vec<Packet<MessageKind>> {
+        self.log[index].as_mut().unwrap().done = true;
+
+        let predecessor = proposal
+            .flow
+            .diffuse_to
+            .iter()
+            .find(|(_, diffuses_to)| diffuses_to.contains(&self.node))
+            .map(|(predecessor, _)| *predecessor);
+
+        predecessor
+            .map(|predecessor| {
+                vec![Packet {
+                    from: self.node,
+                    to: predecessor,
+                    data: MessageKind::Ack(AckMessage { index, proposal }),
+                }]
+            })
+            .unwrap_or(Vec::new())
     }
 
     pub fn process_ack(&mut self, from: NodeId, ack: AckMessage) -> Vec<Packet<MessageKind>> {
@@ -389,14 +393,7 @@ impl CroissusState {
         } else {
             // TODO: Is it possible for 2 proposal's from different nodes to have the same echo?
             //TODO: Refactor try_ack
-            match self.try_ack(ack.index, ack.proposal) {
-                None => Vec::new(),
-                Some((to, ack)) => vec![Packet{
-                    from: self.node,
-                    to,
-                    data: ack,
-                }]
-            }
+            self.try_ack(ack.index, ack.proposal)
         }
     }
 

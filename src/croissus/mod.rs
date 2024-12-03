@@ -14,9 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::select;
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::oneshot::Sender;
 use tokio::sync::{oneshot, Mutex};
-use tokio::sync::oneshot::error::RecvError;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
