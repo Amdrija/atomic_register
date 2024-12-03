@@ -324,11 +324,9 @@ impl CroissusState {
         echoes.insert(from);
 
         // TODO: Is it possible for 2 proposal's from different nodes to have the same echo?
-        //TODO: Refactor try_ack
         self.try_ack(echo.index, echo.proposal)
     }
 
-    // TODO: Refactor so this also returns a vector of packets
     pub fn try_ack(&mut self, index: usize, proposal: Proposal) -> Vec<Packet<MessageKind>> {
         if self.can_ack(index) {
             return self.ack(index, proposal);
@@ -392,7 +390,6 @@ impl CroissusState {
             Vec::new()
         } else {
             // TODO: Is it possible for 2 proposal's from different nodes to have the same echo?
-            //TODO: Refactor try_ack
             self.try_ack(ack.index, ack.proposal)
         }
     }
