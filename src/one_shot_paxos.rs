@@ -244,7 +244,7 @@ impl Paxos {
 #[cfg(test)]
 mod test {
     use crate::core::{create_channel_network, NodeId, Packet, VirtualNetwork};
-    use crate::paxos::{Message, Paxos};
+    use crate::one_shot_paxos::{Message, Paxos};
     use futures::future::JoinAll;
     use std::collections::HashMap;
     use std::sync::Arc;

@@ -17,6 +17,7 @@ mod core;
 mod croissus;
 mod multipaxos;
 mod network;
+mod one_shot_paxos;
 mod paxos;
 
 #[allow(dead_code)]
