@@ -33,6 +33,7 @@ pub struct RejectMessage {
     pub index: usize,
     pub proposal_number: ProposalNumber,
     pub highest_proposal_number: ProposalNumber,
+    pub decided_value: Option<Command>,
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]

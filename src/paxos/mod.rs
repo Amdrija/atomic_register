@@ -43,6 +43,15 @@ impl Paxos {
         (paxos, handle)
     }
 
+    pub async fn propose_next(&self, command: Command) {
+        loop {
+            let index = self.state.lock().await.first_undecided_index();
+            if let Ok(_) = self.propose(index, command.clone()).await {
+                return;
+            }
+        }
+    }
+
     pub async fn propose(&self, index: usize, command: Command) -> Result<()> {
         let (packets, decided) = {
             let mut state = self.state.lock().await;
@@ -168,44 +177,52 @@ impl Paxos {
 #[cfg(test)]
 mod tests {
     use crate::command::{Command, CommandKind, WriteCommand};
-    use crate::core::create_channel_network;
+    use crate::core::{create_channel_network, NodeId};
+    use crate::logger_test_initializer;
     use crate::paxos::Paxos;
     use futures::future::JoinAll;
-    use std::env::set_var;
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use std::time::Duration;
+    use tokio::task::JoinHandle;
 
-    #[tokio::test]
-    async fn test_paxos_syncrhonous() {
-        unsafe {
-            set_var("RUST_LOG", "TRACE");
-        }
-        pretty_env_logger::init_timed();
-        let nodes = vec![0, 1, 2, 3, 4];
+    fn init_test(nodes: Vec<NodeId>) -> (HashMap<NodeId, Arc<Paxos>>, JoinAll<JoinHandle<()>>) {
+        logger_test_initializer::init_logger();
 
         let (mut virtual_networks, mut receivers) = create_channel_network(nodes.clone());
 
         let (paxoses, handles): (Vec<_>, Vec<_>) = nodes
             .iter()
             .map(|node| {
-                Paxos::new(
+                let (paxos, handle) = Paxos::new(
                     virtual_networks.remove(node).unwrap(),
                     nodes.clone(),
                     receivers.remove(node).unwrap(),
-                )
+                );
+                ((*node, paxos), handle)
             })
             .unzip();
 
+        (paxoses.into_iter().collect(), handles.into_iter().collect())
+    }
+
+    #[tokio::test]
+    async fn test_paxos_syncrhonous() {
+        let nodes = vec![0, 1, 2, 3, 4];
+
+        let (paxoses, join_task) = init_test(nodes.clone());
+
         tokio::time::sleep(Duration::from_millis(100)).await;
-        for (node, paxos) in paxoses.iter().enumerate() {
+        for (node, paxos) in paxoses.iter() {
             let result = paxos
                 .propose(
-                    node + 1,
+                    *node as usize + 1,
                     Command {
                         id: 1,
-                        client_id: node as u64,
+                        client_id: *node as u64,
                         command_kind: CommandKind::Write(WriteCommand {
-                            key: 10 + node as u64,
-                            value: 20 + node as u32,
+                            key: 10 + *node as u64,
+                            value: 20 + *node as u32,
                         }),
                     },
                 )
@@ -213,20 +230,117 @@ mod tests {
             assert!(result.is_ok());
         }
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let log_0 = paxoses[0].state.lock().await.get_log().clone();
+        assert!(all_logs_valid(0, &paxoses).await);
 
-        let mut logs = Vec::new();
-        for paxos in paxoses {
-            logs.push(paxos.state.lock().await.get_log().clone());
-            paxos.quit();
-        }
-        assert!(logs.iter().all(|log| *log == log_0));
-
-        handles.into_iter().collect::<JoinAll<_>>().await;
+        paxoses.iter().for_each(|(_, paxos)| paxos.quit());
+        join_task.await;
     }
 
-    // TODO: Implement concurrent test
+    #[tokio::test]
+    async fn test_paxos_concurrent() {
+        let nodes = vec![0, 1, 2, 3, 4];
+
+        let (paxoses, join_task) = init_test(nodes.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut handles = Vec::new();
+        for node in nodes.clone() {
+            let paxos_clone = paxoses[&node].clone();
+            let handle = tokio::spawn(async move {
+                paxos_clone
+                    .propose(
+                        1,
+                        Command {
+                            id: 1,
+                            client_id: node as u64,
+                            command_kind: CommandKind::Write(WriteCommand {
+                                key: 10 + node as u64,
+                                value: 20 + node as u32,
+                            }),
+                        },
+                    )
+                    .await
+            });
+            handles.push(handle);
+        }
+        handles.into_iter().collect::<JoinAll<_>>().await;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(all_logs_valid(0, &paxoses).await);
+
+        paxoses.iter().for_each(|(_, paxos)| paxos.quit());
+        join_task.await;
+    }
+
+    #[tokio::test]
+    async fn test_paxos_next_synchronous() {
+        let nodes = vec![0, 1, 2, 3, 4];
+
+        let (paxoses, join_task) = init_test(nodes.clone());
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for (node, paxos) in paxoses.iter() {
+            paxos
+                .propose_next(Command {
+                    id: 1,
+                    client_id: *node as u64,
+                    command_kind: CommandKind::Write(WriteCommand {
+                        key: 10 + *node as u64,
+                        value: 20 + *node as u32,
+                    }),
+                })
+                .await;
+        }
+
+        assert!(all_logs_valid(0, &paxoses).await);
+
+        paxoses.iter().for_each(|(_, paxos)| paxos.quit());
+        join_task.await;
+    }
+
+    #[tokio::test]
+    async fn test_paxos_next_concurrent() {
+        let nodes = vec![0, 1, 2, 3, 4];
+
+        let (paxoses, join_task) = init_test(nodes.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut handles = Vec::new();
+        for node in nodes.clone() {
+            let paxos_clone = paxoses[&node].clone();
+            let handle = tokio::spawn(async move {
+                paxos_clone
+                    .propose_next(Command {
+                        id: 1,
+                        client_id: node as u64,
+                        command_kind: CommandKind::Write(WriteCommand {
+                            key: 10 + node as u64,
+                            value: 20 + node as u32,
+                        }),
+                    })
+                    .await
+            });
+            handles.push(handle);
+        }
+        handles.into_iter().collect::<JoinAll<_>>().await;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(all_logs_valid(0, &paxoses).await);
+
+        paxoses.iter().for_each(|(_, paxos)| paxos.quit());
+        join_task.await;
+    }
 
     // TODO: Implement test for propose at the next available slot
+
+    async fn all_logs_valid(node: NodeId, paxoses: &HashMap<NodeId, Arc<Paxos>>) -> bool {
+        let log_0 = paxoses[&node].state.lock().await.get_log().clone();
+
+        let mut logs = Vec::new();
+        for (_, paxos) in paxoses.into_iter() {
+            let log = paxos.state.lock().await.get_log().clone();
+            logs.push(log);
+        }
+        logs.iter().all(|log| *log == log_0)
+    }
 }

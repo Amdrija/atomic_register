@@ -15,6 +15,7 @@ mod command;
 mod config;
 mod core;
 mod croissus;
+mod logger_test_initializer;
 mod multipaxos;
 mod network;
 mod one_shot_paxos;

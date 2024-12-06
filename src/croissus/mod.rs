@@ -209,27 +209,17 @@ mod tests {
     use crate::command::{Command, CommandKind, WriteCommand};
     use crate::core::{create_channel_network, NodeId};
     use crate::croissus::{Croissus, CroissusResult};
+    use crate::logger_test_initializer;
     use futures::future::TryJoinAll;
     use std::collections::HashMap;
-    use std::env::set_var;
-    use std::sync::{Arc, Once};
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::task::JoinHandle;
-
-    static INIT_LOGGER: Once = Once::new();
-    fn init_logger() {
-        INIT_LOGGER.call_once(|| {
-            unsafe {
-                set_var("RUST_LOG", "TRACE");
-            }
-            pretty_env_logger::init_timed();
-        });
-    }
 
     fn init_test(
         nodes: &Vec<NodeId>,
     ) -> (HashMap<NodeId, Arc<Croissus>>, TryJoinAll<JoinHandle<()>>) {
-        init_logger();
+        logger_test_initializer::init_logger();
         let (mut virtual_networks, mut receivers) = create_channel_network(nodes.clone());
 
         let mut croissuses = HashMap::new();

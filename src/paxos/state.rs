@@ -5,7 +5,7 @@ use crate::paxos::messages::{
     AcceptMessage, DecidedMessage, Message, PrepareMessage, PromiseMessage, ProposeMessage,
     RejectMessage,
 };
-use log::error;
+use log::{debug, error};
 use rkyv::{Archive, Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -142,10 +142,17 @@ impl PaxosState {
                 accepted: self.log[prepare.index].accepted.clone(),
             })
         } else {
+            let decided_value = if self.log[prepare.index].promised == INFINITE_PROPOSAL {
+                Some(self.log[prepare.index].accepted.as_ref().unwrap().1.clone())
+            } else {
+                None
+            };
+
             Message::Reject(RejectMessage {
                 index: prepare.index,
                 proposal_number: prepare.proposal_number,
                 highest_proposal_number: self.log[prepare.index].promised.clone(),
+                decided_value,
             })
         };
 
@@ -207,10 +214,17 @@ impl PaxosState {
                 propsoal_number: propose.proposal_number,
             })
         } else {
+            let decided_value = if self.log[propose.index].promised == INFINITE_PROPOSAL {
+                Some(self.log[propose.index].accepted.as_ref().unwrap().1.clone())
+            } else {
+                None
+            };
+
             Message::Reject(RejectMessage {
                 index: propose.index,
                 proposal_number: propose.proposal_number,
                 highest_proposal_number: self.log[propose.index].promised.clone(),
+                decided_value,
             })
         };
 
@@ -226,37 +240,7 @@ impl PaxosState {
             self.accept_acks += 1;
             if self.accept_acks == self.majority_threshold {
                 //Decide whichever value was proposed.
-                self.log[self.current_index] = Slot {
-                    promised: INFINITE_PROPOSAL.clone(),
-                    accepted: Some((INFINITE_PROPOSAL.clone(), self.proposed_value.clone())),
-                };
-
-                match self.decide.take() {
-                    None => {
-                        error!(
-                            "Node {} didn't set the decided channel to finish decide",
-                            self.node
-                        );
-                        panic!(
-                            "Node {} didn't set the decided channel to finish decide",
-                            self.node
-                        );
-                    }
-                    Some(decide) => {
-                        if let Err(_) = decide.send(self.proposed_value.clone()) {
-                            error!("Node {} decided channel receiver has been dropped, probably due to finishing the propose.", self.node);
-                            panic!("Node {} decided channel receiver has been dropped, probably due to finishing the propose.", self.node);
-                        }
-                        return core::make_broadcast_packets(
-                            self.node,
-                            &self.nodes,
-                            Message::Decide(DecidedMessage {
-                                index: self.current_index,
-                                command: self.proposed_value.clone(),
-                            }),
-                        );
-                    }
-                }
+                return self.decide(self.current_index, self.proposed_value.clone());
             }
         }
 
@@ -267,6 +251,10 @@ impl PaxosState {
         if reject_message.index == self.current_index
             && reject_message.proposal_number == self.current_proposal
         {
+            if reject_message.highest_proposal_number == INFINITE_PROPOSAL {
+                return self.decide(self.current_index, reject_message.decided_value.unwrap());
+            }
+
             return self.go_to_propose(
                 self.current_index,
                 reject_message.highest_proposal_number.round + 1,
@@ -277,7 +265,6 @@ impl PaxosState {
     }
 
     pub fn process_decide(&mut self, decide: DecidedMessage) {
-        // TODO: Implement
         self.set_log(
             decide.index,
             Slot {
@@ -287,11 +274,7 @@ impl PaxosState {
         );
     }
 
-    pub fn get_log(&self) -> &Vec<Slot> {
-        &self.log
-    }
-
-    fn first_unchosen_index(&self) -> usize {
+    pub fn first_undecided_index(&self) -> usize {
         self.log
             .iter()
             .enumerate()
@@ -300,11 +283,40 @@ impl PaxosState {
             .unwrap_or(self.log.len())
     }
 
+    pub fn get_log(&self) -> &Vec<Slot> {
+        &self.log
+    }
+
     fn set_log(&mut self, index: usize, slot: Slot) {
         if index >= self.log.len() {
             self.log.resize(index + 1, Slot::empty());
         }
 
         self.log[index] = slot;
+    }
+
+    fn decide(&mut self, index: usize, command: Command) -> Vec<Packet<Message>> {
+        self.log[index] = Slot {
+            promised: INFINITE_PROPOSAL.clone(),
+            accepted: Some((INFINITE_PROPOSAL.clone(), command.clone())),
+        };
+
+        match self.decide.take() {
+            None => {
+                debug!("Node {} already decided at slot {}", self.node, index);
+                Vec::new()
+            }
+            Some(decide) => {
+                if let Err(_) = decide.send(command.clone()) {
+                    error!("Node {} decided channel receiver has been dropped, probably due to finishing the propose.", self.node);
+                    panic!("Node {} decided channel receiver has been dropped, probably due to finishing the propose.", self.node);
+                }
+                core::make_broadcast_packets(
+                    self.node,
+                    &self.nodes,
+                    Message::Decide(DecidedMessage { index, command }),
+                )
+            }
+        }
     }
 }
