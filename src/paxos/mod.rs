@@ -14,8 +14,8 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-mod messages;
-mod state;
+pub mod messages;
+pub mod state;
 
 pub struct Paxos {
     network: VirtualNetwork<Message>,

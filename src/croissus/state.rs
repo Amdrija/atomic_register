@@ -3,7 +3,7 @@ use crate::core;
 use crate::core::{NodeId, Packet};
 use crate::croissus::flow::Flow;
 use crate::croissus::messages::{
-    AckMessage, DiffuseMessage, EchoMessage, LockMessage, LockReplyMessage, MessageKind,
+    AckMessage, DiffuseMessage, EchoMessage, LockMessage, LockReplyMessage, Message,
 };
 use log::{debug, error};
 use rkyv::{Archive, Deserialize, Serialize};
@@ -97,7 +97,7 @@ impl CroissusState {
     pub fn propose(
         &mut self,
         command: Command,
-    ) -> (Vec<Packet<MessageKind>>, usize, oneshot::Receiver<()>) {
+    ) -> (Vec<Packet<Message>>, usize, oneshot::Receiver<()>) {
         let proposal = Proposal {
             command,
             proposer: self.node,
@@ -127,7 +127,7 @@ impl CroissusState {
 
     pub fn go_to_lock_phase(
         &mut self,
-    ) -> (Vec<Packet<MessageKind>>, oneshot::Receiver<Option<Command>>) {
+    ) -> (Vec<Packet<Message>>, oneshot::Receiver<Option<Command>>) {
         let (finish_lock_phase, lock_phase_finished) = oneshot::channel();
         self.finish_lock_phase.replace(finish_lock_phase);
         self.fetched_states.clear();
@@ -136,7 +136,7 @@ impl CroissusState {
             core::make_broadcast_packets(
                 self.node,
                 &self.nodes,
-                MessageKind::Lock(LockMessage {
+                Message::Lock(LockMessage {
                     index: self.current_index,
                 }),
             ),
@@ -161,7 +161,7 @@ impl CroissusState {
         }
     }
 
-    pub fn process_diffuse(&mut self, diffuse: DiffuseMessage) -> Vec<Packet<MessageKind>> {
+    pub fn process_diffuse(&mut self, diffuse: DiffuseMessage) -> Vec<Packet<Message>> {
         if self.is_locked(diffuse.index) {
             debug!("Node {} is locked, aborting diffuse", self.node); // TODO: Send NACK optimization
             return Vec::new();
@@ -186,7 +186,7 @@ impl CroissusState {
         packets
     }
 
-    pub fn process_echo(&mut self, from: NodeId, echo: EchoMessage) -> Vec<Packet<MessageKind>> {
+    pub fn process_echo(&mut self, from: NodeId, echo: EchoMessage) -> Vec<Packet<Message>> {
         if echo.index >= self.log.len() {
             self.set_log(echo.index, ProposalSlot::None);
         }
@@ -203,7 +203,7 @@ impl CroissusState {
         self.try_ack(echo.index, echo.proposal)
     }
 
-    pub fn process_ack(&mut self, from: NodeId, ack: AckMessage) -> Vec<Packet<MessageKind>> {
+    pub fn process_ack(&mut self, from: NodeId, ack: AckMessage) -> Vec<Packet<Message>> {
         // This will never panic, as in order to get an ack for a certain index, the node must first
         // have diffused a proposal for that index. Before node diffuses a proposal, it extends
         // the log until the proposal's index and also sets the slot to be that proposal.
@@ -239,23 +239,27 @@ impl CroissusState {
         }
     }
 
-    pub fn process_lock(&mut self, from: NodeId, lock: LockMessage) -> Vec<Packet<MessageKind>> {
+    pub fn process_lock(&mut self, from: NodeId, lock: LockMessage) -> Vec<Packet<Message>> {
         let locked_state = self.lock(lock.index);
 
         vec![Packet {
             from: self.node,
             to: from,
-            data: MessageKind::LockReply(LockReplyMessage {
+            data: Message::LockReply(LockReplyMessage {
                 index: lock.index,
                 locked_state,
             }),
         }]
     }
 
-    pub fn process_lock_reply(&mut self, from: NodeId, lock_reply: LockReplyMessage) {
+    pub fn process_lock_reply(
+        &mut self,
+        from: NodeId,
+        lock_reply: LockReplyMessage,
+    ) -> Vec<Packet<Message>> {
         if self.current_index != lock_reply.index {
             // Ignore old lock replies
-            return;
+            return Vec::new();
         }
 
         self.fetched_states.insert(from, lock_reply.locked_state);
@@ -289,31 +293,33 @@ impl CroissusState {
                 Some(finish_lock) => finish_lock.send(command).unwrap(),
             }
         }
+
+        Vec::new()
     }
 
     fn make_echo_packets<'a>(
         &'a self,
         diffuse: &'a DiffuseMessage,
-    ) -> impl Iterator<Item = Packet<MessageKind>> + 'a {
+    ) -> impl Iterator<Item = Packet<Message>> + 'a {
         diffuse.proposal.flow.echo_to[&self.node]
             .iter()
             .map(|sibling| Packet {
                 from: self.node,
                 to: *sibling,
-                data: MessageKind::Echo(EchoMessage {
+                data: Message::Echo(EchoMessage {
                     index: diffuse.index,
                     proposal: diffuse.proposal.clone(),
                 }),
             })
     }
 
-    fn make_diffuse_packets(&self, diffuse: DiffuseMessage) -> Vec<Packet<MessageKind>> {
+    fn make_diffuse_packets(&self, diffuse: DiffuseMessage) -> Vec<Packet<Message>> {
         diffuse.proposal.flow.diffuse_to[&self.node]
             .iter()
             .map(|to| Packet {
                 from: self.node,
                 to: *to,
-                data: MessageKind::Diffuse(diffuse.clone()),
+                data: Message::Diffuse(diffuse.clone()),
             })
             .collect()
     }
@@ -404,7 +410,7 @@ impl CroissusState {
             .unwrap_or(self.log.len())
     }
 
-    fn try_ack(&mut self, index: usize, proposal: Proposal) -> Vec<Packet<MessageKind>> {
+    fn try_ack(&mut self, index: usize, proposal: Proposal) -> Vec<Packet<Message>> {
         if self.can_ack(index) {
             return self.ack(index, proposal);
         }
@@ -412,7 +418,7 @@ impl CroissusState {
         Vec::new()
     }
 
-    fn ack(&mut self, index: usize, proposal: Proposal) -> Vec<Packet<MessageKind>> {
+    fn ack(&mut self, index: usize, proposal: Proposal) -> Vec<Packet<Message>> {
         self.log[index].as_mut().unwrap().done = true;
 
         // The code works even if there are more predecessors, even though the algorithm only
@@ -428,7 +434,7 @@ impl CroissusState {
             .map(|predecessor| Packet {
                 from: self.node,
                 to: predecessor,
-                data: MessageKind::Ack(AckMessage {
+                data: Message::Ack(AckMessage {
                     index,
                     proposal: proposal.clone(),
                 }),

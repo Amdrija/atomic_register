@@ -17,15 +17,15 @@ pub struct ProposalNumber {
     node: NodeId,
 }
 
-const INFINITE_PROPOSAL: ProposalNumber = ProposalNumber {
+pub const INFINITE_PROPOSAL: ProposalNumber = ProposalNumber {
     round: u64::MAX,
     node: NodeId::MAX,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Slot {
-    promised: ProposalNumber,
-    accepted: Option<(ProposalNumber, Command)>,
+    pub promised: ProposalNumber,
+    pub accepted: Option<(ProposalNumber, Command)>,
 }
 
 impl Slot {
@@ -275,7 +275,7 @@ impl PaxosState {
         Vec::new()
     }
 
-    pub fn process_decide(&mut self, decide: DecidedMessage) {
+    pub fn process_decide(&mut self, decide: DecidedMessage) -> Vec<Packet<Message>> {
         self.set_log(
             decide.index,
             Slot {
@@ -283,6 +283,8 @@ impl PaxosState {
                 accepted: Some((INFINITE_PROPOSAL.clone(), decide.command)),
             },
         );
+
+        Vec::new()
     }
 
     pub fn first_undecided_index(&self) -> usize {

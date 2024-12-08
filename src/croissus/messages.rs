@@ -31,7 +31,7 @@ pub struct LockReplyMessage {
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
-pub enum MessageKind {
+pub enum Message {
     Diffuse(DiffuseMessage),
     Echo(EchoMessage),
     Ack(AckMessage), // Does an ack need to be identified?
