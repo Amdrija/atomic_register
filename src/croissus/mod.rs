@@ -27,7 +27,7 @@ pub enum HybridMessage {
     Croissus(CroissusMessage),
 }
 
-struct Croissus {
+pub struct Croissus {
     network: VirtualNetwork<HybridMessage>,
     nodes: Vec<NodeId>,
     croissus_state: Arc<Mutex<CroissusState>>,

@@ -1,6 +1,7 @@
 use crate::abd::ABD;
 use crate::command::{Command, CommandKind, WriteCommand};
 use crate::config::Config;
+use crate::croissus::Croissus;
 use crate::multipaxos::Multipaxos;
 use crate::network::initialize_connections;
 use anyhow::Result;
@@ -22,7 +23,48 @@ mod one_shot_paxos;
 mod paxos;
 
 #[allow(dead_code)]
-async fn run_paxos() -> Result<()> {
+async fn run_croissus() -> Result<()> {
+    info!("Started");
+    let mut config = Config::new()?;
+    info!("Finished parsing config: {:#?}", config);
+
+    let (virtual_network, receiver_channel, read_tasks, send_loop_tasks) =
+        initialize_connections(&config).await?;
+    info!("Initialized connections to all nodes");
+
+    let (croissus, handle) = Croissus::new(
+        virtual_network,
+        config.nodes.keys().cloned().collect(),
+        Duration::from_millis(100), //TODO: Change when testing with a different topology
+        receiver_channel,
+    );
+    tokio::time::sleep(Duration::from_secs(5 + config.my_node_id as u64)).await;
+    croissus
+        .propose(Command {
+            id: 1,
+            client_id: config.my_node_id as u64,
+            command_kind: CommandKind::Write(WriteCommand {
+                key: 10 + config.my_node_id as u64,
+                value: 20 + config.my_node_id as u32,
+            }),
+        })
+        .await;
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    println!("{:?}", croissus.get_decided_log().await);
+
+    croissus.quit();
+    handle.await?;
+    drop(croissus);
+    read_tasks.await?.into_iter().collect::<Result<()>>()?;
+    send_loop_tasks.await?.into_iter().collect::<Result<()>>()?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+async fn run_multipaxos() -> Result<()> {
     info!("Started");
     let mut config = Config::new()?;
     info!("Finished parsing config: {:#?}", config);
@@ -166,7 +208,7 @@ async fn run_abd() -> Result<()> {
 #[tokio::main]
 async fn main() {
     pretty_env_logger::init_timed();
-    if let Err(error) = run_paxos().await {
+    if let Err(error) = run_croissus().await {
         error!("Error encountered while sending: {error}");
         exit(1);
     }
