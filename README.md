@@ -11,7 +11,10 @@ Unlike most commercial key-value stores, an important distinction of this projec
 ## Algorithms
 
 - [x] [ABD](https://dl.acm.org/doi/pdf/10.1145/200836.200869)
+- [x] [One-shot Paxos](https://lamport.azurewebsites.net/pubs/paxos-simple.pdf)
 - [x] [Paxos](https://lamport.azurewebsites.net/pubs/paxos-simple.pdf)
+- [x] [Multipaxos](https://github.com/ongardie/dissertation/blob/master/userstudymaterials/paxossummary.pdf)
+- [x] Croissus :)
 - [ ] [Fast Paxos](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/tr-2005-112.pdf)
 - [ ] [Raft](https://raft.github.io/)
 
