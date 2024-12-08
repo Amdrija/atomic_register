@@ -55,7 +55,7 @@ impl Paxos {
     pub async fn propose(&self, index: usize, command: Command) -> Result<()> {
         let (packets, decided) = {
             let mut state = self.state.lock().await;
-            state.propose(index, command.clone())
+            state.propose(index, command.clone())?
         };
         self.network.send_packets(packets).await;
 
@@ -331,7 +331,31 @@ mod tests {
         join_task.await;
     }
 
-    // TODO: Implement test for propose at the next available slot
+    #[tokio::test]
+    async fn test_paxos_propose_at_decided_index() {
+        let nodes = vec![0, 1, 2, 3, 4];
+
+        let (paxoses, join_task) = init_test(nodes.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let result = paxoses[&0]
+            .propose(
+                0,
+                Command {
+                    id: 0,
+                    client_id: 0,
+                    command_kind: CommandKind::Write(WriteCommand { key: 1, value: 1 }),
+                },
+            )
+            .await;
+        assert!(result.is_err());
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(all_logs_valid(0, &paxoses).await);
+
+        paxoses.iter().for_each(|(_, paxos)| paxos.quit());
+        join_task.await;
+    }
 
     async fn all_logs_valid(node: NodeId, paxoses: &HashMap<NodeId, Arc<Paxos>>) -> bool {
         let log_0 = paxoses[&node].state.lock().await.get_log().clone();

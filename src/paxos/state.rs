@@ -5,6 +5,8 @@ use crate::paxos::messages::{
     AcceptMessage, DecidedMessage, Message, PrepareMessage, PromiseMessage, ProposeMessage,
     RejectMessage,
 };
+use anyhow::anyhow;
+use anyhow::Result;
 use log::{debug, error};
 use rkyv::{Archive, Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -84,24 +86,33 @@ impl PaxosState {
         }
     }
 
-    // TODO: Implement propose at the next available slot
-
     pub fn propose(
         &mut self,
         index: usize,
         command: Command,
-    ) -> (Vec<Packet<Message>>, oneshot::Receiver<Command>) {
+    ) -> Result<(Vec<Packet<Message>>, oneshot::Receiver<Command>)> {
         self.default_value_to_propose = command.clone();
         let (send, recv) = oneshot::channel();
         self.decide.replace(send);
 
-        let next_round = self
+        let round = self
             .log
             .get(index)
             .map(|slot| slot.promised.round)
-            .unwrap_or(0)
-            + 1;
-        (self.go_to_propose(index, next_round), recv)
+            .unwrap_or(0);
+        // In theory, it is possible that 2 nodes livelock each other until everyone promises
+        // INFINITY, and then the propose fails. In practice, even if the nodes managed to
+        // complete a propose/prepare in 1ns, it would still take 31 years to fill u64, so
+        // we are fine until ~2050.
+        if round == u64::MAX {
+            return Err(anyhow!(
+                "Node {} already decied a value at index {}",
+                self.node,
+                index
+            ));
+        }
+
+        Ok((self.go_to_propose(index, round + 1), recv))
     }
 
     fn go_to_propose(&mut self, index: usize, round: u64) -> Vec<Packet<Message>> {
