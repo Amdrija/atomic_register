@@ -18,6 +18,7 @@ mod core;
 mod croissus;
 mod logger_test_initializer;
 mod multipaxos;
+mod multipaxos2;
 mod network;
 mod one_shot_paxos;
 mod paxos;
