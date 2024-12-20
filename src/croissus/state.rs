@@ -59,6 +59,7 @@ impl CroissusResult {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_adopted(&self) -> bool {
         match self {
             CroissusResult::Adopted(_) => true,

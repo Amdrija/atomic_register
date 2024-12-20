@@ -26,7 +26,7 @@ mod paxos;
 #[allow(dead_code)]
 async fn run_croissus() -> Result<()> {
     info!("Started");
-    let mut config = Config::new()?;
+    let config = Config::new()?;
     info!("Finished parsing config: {:#?}", config);
 
     let (virtual_network, receiver_channel, read_tasks, send_loop_tasks) =

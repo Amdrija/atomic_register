@@ -180,7 +180,7 @@ impl MultipaxosState {
 
     pub fn process_reject_prepare(
         &mut self,
-        from: NodeId,
+        _from: NodeId,
         reject_prepare_message: RejectPrepareMessage,
     ) -> Vec<Packet<Message>> {
         if self.current_proposal < reject_prepare_message.proposal_number {
@@ -193,7 +193,7 @@ impl MultipaxosState {
 
     pub fn process_promise(
         &mut self,
-        from: NodeId,
+        _from: NodeId,
         promise_message: PromiseMessage,
     ) -> Vec<Packet<Message>> {
         if promise_message.proposal_number != self.current_proposal {

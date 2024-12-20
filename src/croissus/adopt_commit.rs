@@ -4,7 +4,7 @@ use crate::croissus::flow::Flow;
 use crate::croissus::messages::{
     AckMessage, DiffuseMessage, EchoMessage, LockMessage, LockReplyMessage, Message,
 };
-use crate::croissus::state::{CroissusResult, CroissusState, LockedState};
+use crate::croissus::state::{CroissusResult, CroissusState};
 use anyhow::{anyhow, Result};
 use log::{debug, error, info};
 use std::sync::Arc;
